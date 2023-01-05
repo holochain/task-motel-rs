@@ -19,6 +19,10 @@ pub use manager::*;
 
 mod signal;
 pub use signal::*;
+
+mod task;
+pub use task::*;
+
 use tokio::{sync::broadcast::error::SendError, task::JoinHandle};
 
 #[cfg(test)]

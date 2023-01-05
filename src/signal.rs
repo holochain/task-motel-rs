@@ -1,3 +1,6 @@
+//! Stop signal broadcasters and receivers
+//!
+
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -11,35 +14,32 @@ use broadcast::error::TryRecvError;
 #[derive(Clone)]
 pub struct StopBroadcaster {
     txs: Vec<broadcast::Sender<()>>,
-    merged: bool,
 }
 
 impl StopBroadcaster {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1);
-        StopBroadcaster {
-            txs: vec![tx],
-            merged: false,
-        }
+        StopBroadcaster { txs: vec![tx] }
     }
 
-    pub fn merge(&self, other: &Self) -> Self {
-        let mut txs = self.txs.clone();
-        txs.extend(other.txs.clone());
-        Self { txs, merged: false }
+    pub fn merge(&mut self, other: &Self) -> &mut Self {
+        self.txs.extend(other.txs.clone());
+        self
     }
 
     pub fn receiver(&self) -> StopSignal {
         StopSignal(self.txs.iter().map(|b| b.subscribe()).collect())
     }
 
-    pub fn emit(&mut self) -> Result<(), broadcast::error::SendError<()>> {
-        if !self.merged {
-            for tx in self.txs.iter() {
-                tx.send(())?;
-            }
+    pub fn emit(&mut self) {
+        for tx in self.txs.iter() {
+            // If the receiver is dropped, we don't care.
+            tx.send(()).ok();
         }
-        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.txs.len()
     }
 
     // fn into_inner(self) -> Vec<broadcast::Sender<()>> {
@@ -49,9 +49,7 @@ impl StopBroadcaster {
 
 impl Drop for StopBroadcaster {
     fn drop(&mut self) {
-        if let Err(_) = self.emit() {
-            tracing::error!("A StopBroadcaster could not emit its signal");
-        }
+        self.emit()
     }
 }
 
@@ -84,20 +82,16 @@ impl Future for StopSignal {
 mod tests {
     use super::*;
 
-    async fn assert_not_ready(f: impl Future<Output = ()>) {
-        assert!(
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
-                .await
-                .is_err()
-        );
+    async fn not_ready(f: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
+            .await
+            .is_err()
     }
 
-    async fn assert_ready(f: impl Future<Output = ()>) {
-        assert!(
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
-                .await
-                .is_ok()
-        );
+    async fn ready(f: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
+            .await
+            .is_ok()
     }
 
     #[tokio::test]
@@ -105,35 +99,36 @@ mod tests {
         let a = StopBroadcaster::new();
         let s1 = a.receiver();
         let s2 = a.receiver();
-        assert_not_ready(s1).await;
+        assert!(not_ready(s1).await);
         drop(a);
-        assert_ready(s2).await;
+        assert!(ready(s2).await);
     }
 
     #[tokio::test]
     async fn test_signal_merged() {
+        let mut x = StopBroadcaster::new();
+        let mut y = x.clone();
         let a = StopBroadcaster::new();
         let b = StopBroadcaster::new();
         let c = StopBroadcaster::new();
-        let d = StopBroadcaster::new();
-        let x = a.merge(&b).merge(&c);
-        let y = x.merge(&d);
+        x.merge(&a).merge(&b);
+        y.merge(&x).merge(&c);
 
         let s1 = y.receiver();
         let s2 = y.receiver();
         let s3 = y.receiver();
 
-        assert_not_ready(s1).await;
+        assert!(not_ready(s1).await);
         drop(x);
-        assert_not_ready(s2).await;
-        drop(d);
-        assert_ready(s3).await;
+        assert!(not_ready(s2).await);
+        drop(c);
+        assert!(ready(s3).await);
 
         let s4 = y.receiver();
         let s5 = y.receiver();
 
-        assert_not_ready(s4).await;
+        assert!(not_ready(s4).await);
         drop(y);
-        assert_ready(s5).await;
+        assert!(ready(s5).await);
     }
 }

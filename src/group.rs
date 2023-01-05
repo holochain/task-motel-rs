@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
 
 use crate::{
     signal::{StopBroadcaster, StopSignal},
@@ -42,9 +42,7 @@ impl<Info> TaskGroup<Info> {
 
     /// Stop all tasks in this group
     pub fn stop_all(&mut self) {
-        if let Err(err) = self.stop_tx.emit() {
-            tracing::error!("Could not send signal to stop TaskManager tasks! {:?}", err)
-        }
+        self.stop_tx.emit()
     }
 }
 
