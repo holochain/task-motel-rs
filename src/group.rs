@@ -12,7 +12,7 @@ use crate::{
 // #[derive(Clone)]
 pub struct TaskGroup<Info> {
     pub(crate) tasks: Tasks<Info>,
-    stop_tx: StopBroadcaster,
+    pub(crate) stop_tx: StopBroadcaster,
     // new_task_tx: TaskSender<Info>,
     // stop_tx: StopBroadcaster,
 }

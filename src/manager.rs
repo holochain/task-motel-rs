@@ -47,13 +47,29 @@ impl<GroupKey, Info: Clone + Unpin> TaskManager<GroupKey, Info>
 where
     GroupKey: std::fmt::Debug + Hash + Eq + Clone,
 {
-    pub fn add_group(&mut self, key: GroupKey, parent: Option<GroupKey>) {
+    /// Add an empty task group, optionally specifying the parent group
+    pub fn add_group(&mut self, mut key: GroupKey, parent: Option<GroupKey>) {
         if let Some(parent) = parent {
             self.parents.insert(key.clone(), parent);
         }
-        self.groups.entry(key).or_insert_with(TaskGroup::new);
+        let stopper = self
+            .groups
+            .entry(key.clone())
+            .or_insert_with(TaskGroup::new)
+            .stop_tx
+            .clone();
+
+        while let Some(parent_key) = self.parents.get(&key) {
+            self.groups
+                .get_mut(parent_key)
+                .unwrap()
+                .stop_tx
+                .merge(&stopper);
+            key = parent_key.clone();
+        }
     }
 
+    /// Add a task to a group
     pub async fn add_task(
         &mut self,
         key: &GroupKey,
@@ -67,6 +83,7 @@ where
         }
     }
 
+    /// Remove a group (TODO refine what this means)
     pub fn remove_group(&mut self, key: &GroupKey) -> TmResult {
         // TODO: actually await group completion
         if let Some(_group) = self.groups.remove(key) {
@@ -77,6 +94,8 @@ where
         }
     }
 
+    /// Send the stop signal to all tasks in all groups.
+    /// This will not *necessarily* stop the tasks.
     pub fn stop_all(&mut self) -> TmResult {
         // TODO: actually await group completion
         for group in self.groups.values_mut() {
@@ -104,9 +123,8 @@ impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<(GroupKey, Info, Result<TmResult, JoinError>)>> {
-        dbg!();
         if self.groups.is_empty() {
-            dbg!();
+            dbg!("empty");
             // Once all groups are removed, we consider the stream to have ended
             return Poll::Ready(None);
         }
@@ -114,25 +132,20 @@ impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
         if let Some(item) = self
             .groups
             .iter_mut()
-            .map(
-                |(k, v)| match Stream::poll_next(Pin::new(&mut v.tasks), cx) {
+            .map(|(k, v)| {
+                // println!("tasks: {}", v.tasks.len());
+                match Stream::poll_next(Pin::new(&mut v.tasks), cx) {
                     // A task in the group has a result
                     Poll::Ready(Some((info, result))) => {
                         dbg!();
                         Some((k.clone(), info, result))
                     }
                     // No tasks in group
-                    Poll::Ready(None) => {
-                        dbg!();
-                        None
-                    }
+                    Poll::Ready(None) => None,
                     // No tasks ready (all tasks pending)
-                    Poll::Pending => {
-                        dbg!();
-                        None
-                    }
-                },
-            )
+                    Poll::Pending => None,
+                }
+            })
             .flatten()
             .next()
         {
