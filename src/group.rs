@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use futures::stream::FuturesUnordered;
 
 use crate::{
-    signal::{StopBroadcaster, StopSignal},
+    signal::{StopBroadcaster, StopListener},
     Task, Tasks, TmResult,
 };
 
@@ -13,6 +13,7 @@ use crate::{
 pub struct TaskGroup<Info> {
     pub(crate) tasks: Tasks<Info>,
     pub(crate) stop_tx: StopBroadcaster,
+    pub(crate) stop_rx: StopListener,
     // new_task_tx: TaskSender<Info>,
     // stop_tx: StopBroadcaster,
 }
@@ -21,8 +22,12 @@ impl<Info> TaskGroup<Info> {
     /// Constructor
     pub fn new() -> Self {
         let tasks = FuturesUnordered::new();
-        let stop_tx = StopBroadcaster::new();
-        let group = Self { tasks, stop_tx };
+        let (stop_tx, stop_rx) = StopBroadcaster::new();
+        let group = Self {
+            tasks,
+            stop_tx,
+            stop_rx,
+        };
         group
         // let (new_task_tx, new_task_rx) = tokio::sync::mpsc::channel(16);
         // let task = tokio::spawn(run_task_manager(tasks, new_task_rx));
@@ -34,7 +39,7 @@ impl<Info> TaskGroup<Info> {
     ///
     /// The closure should make use of the StopSignal channel in an appropriate way,
     /// so that the task will stop when a signal is received on the channel.
-    pub async fn add(&mut self, f: impl FnOnce(StopSignal) -> Task<Info>) -> TmResult {
+    pub async fn add(&mut self, f: impl FnOnce(StopListener) -> Task<Info>) -> TmResult {
         self.tasks.push(f(self.stop_tx.receiver()));
         Ok(())
         // self.new_task_tx.send(f(&mut self.stop_rx)).await

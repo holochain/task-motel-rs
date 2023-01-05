@@ -1,3 +1,10 @@
+//! Manage tasks arranged in nested groups
+//!
+//! Groups can be added and removed dynamically. When a group is removed,
+//! all of its tasks are stopped, and all of its descendent groups are also removed,
+//! and their contained tasks stopped as well. The group is only completely removed when
+//! all descendent tasks have stopped.
+
 use core::pin::Pin;
 use std::{
     collections::HashMap,
@@ -6,14 +13,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{channel::mpsc, stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
-use tokio::{
-    sync::{broadcast::error::TryRecvError, mpsc::error::SendError},
-    task::{JoinError, JoinHandle},
-};
+use futures::{FutureExt, Stream, StreamExt};
+use tokio::task::JoinError;
 
 use crate::{
-    signal::{StopBroadcaster, StopSignal},
+    signal::{StopBroadcaster, StopListener},
     Task, TaskGroup, TaskHandle, TmResult,
 };
 
@@ -73,7 +77,7 @@ where
     pub async fn add_task(
         &mut self,
         key: &GroupKey,
-        f: impl FnOnce(StopSignal) -> Task<Info>,
+        f: impl FnOnce(StopListener) -> Task<Info>,
     ) -> TmResult {
         if let Some(group) = self.groups.get_mut(key) {
             group.add(f).await?;
@@ -86,9 +90,9 @@ where
     /// Remove a group (TODO refine what this means)
     pub fn remove_group(&mut self, key: &GroupKey) -> TmResult {
         // TODO: actually await group completion
-        if let Some(_group) = self.groups.remove(key) {
+        if let Some(group) = self.groups.remove(key) {
             // by dropping the group, we will signal all tasks to stop.
-            Ok(())
+            Ok(group.stop_tx)
         } else {
             Err(format!("Group doesn't exist: {:?}", key))
         }

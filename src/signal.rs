@@ -1,5 +1,10 @@
 //! Stop signal broadcasters and receivers
 //!
+//! Each TaskGroup has a number of channel receivers associated with it:
+//! one for itself, and one for each descendent Group.
+//! A Group is not considered stopped until all of its receivers have received
+//! at least one message.
+//! Each Group has just one sender, which goes to itself and all ancestor groups.
 
 use std::{
     pin::Pin,
@@ -12,34 +17,21 @@ use tokio::sync::broadcast;
 use broadcast::error::TryRecvError;
 
 #[derive(Clone)]
-pub struct StopBroadcaster {
-    txs: Vec<broadcast::Sender<()>>,
-}
+pub struct StopBroadcaster(broadcast::Sender<()>);
 
 impl StopBroadcaster {
-    pub fn new() -> Self {
+    pub fn new() -> (Self, StopListener) {
         let (tx, _) = broadcast::channel(1);
-        StopBroadcaster { txs: vec![tx] }
+        (StopBroadcaster(tx), StopListener(vec![tx.subscribe()]))
     }
 
-    pub fn merge(&mut self, other: &Self) -> &mut Self {
-        self.txs.extend(other.txs.clone());
-        self
-    }
-
-    pub fn receiver(&self) -> StopSignal {
-        StopSignal(self.txs.iter().map(|b| b.subscribe()).collect())
+    pub fn receiver(&self) -> broadcast::Receiver<()> {
+        self.0.subscribe()
     }
 
     pub fn emit(&mut self) {
-        for tx in self.txs.iter() {
-            // If the receiver is dropped, we don't care.
-            tx.send(()).ok();
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.txs.len()
+        // If a receiver is dropped, we don't care.
+        self.0.send(()).ok();
     }
 
     // fn into_inner(self) -> Vec<broadcast::Sender<()>> {
@@ -61,9 +53,20 @@ impl Drop for StopBroadcaster {
 /// The intention is that as soon as one is received, the task should
 /// gracefully shut itself down. StopSignal is a simple future which ca
 #[derive(Default)]
-pub struct StopSignal(Vec<broadcast::Receiver<()>>);
+pub struct StopListener(Vec<broadcast::Receiver<()>>);
 
-impl Future for StopSignal {
+impl StopListener {
+    pub fn subscribe(&mut self, tx: &StopBroadcaster) -> &mut Self {
+        self.0.push(tx.receiver());
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Future for StopListener {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {

@@ -17,7 +17,7 @@ async fn integration() {
 
     let mut tm: TaskManager<GroupKey, String> = TaskManager::default();
 
-    fn blocker(stop_rx: StopSignal) -> Task<String> {
+    fn blocker(stop_rx: StopListener) -> Task<String> {
         Task {
             handle: tokio::spawn(async move {
                 stop_rx.await;
@@ -28,7 +28,7 @@ async fn integration() {
         }
     }
 
-    fn triggered(stop_rx: StopSignal, trigger_rx: StopSignal) -> Task<String> {
+    fn triggered(stop_rx: StopListener, trigger_rx: StopListener) -> Task<String> {
         let handle = tokio::spawn(async move {
             futures::future::select(stop_rx, trigger_rx).await;
             Ok(())
