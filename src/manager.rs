@@ -183,9 +183,10 @@ mod tests {
         tm.add_task(&D, |stop| blocker("d1", stop)).await.unwrap();
 
         assert!(not_ready(d).await);
+        println!("--------------");
         let d = tm.remove_group(&D).unwrap();
-        dbg!(d.len());
         // d.await;
+        dbg!(d.len());
         assert!(ready(d).await);
         assert!(not_ready(c).await);
 

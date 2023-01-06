@@ -17,16 +17,16 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, Future, FutureExt};
-use tokio::sync::{broadcast, oneshot, OwnedSemaphorePermit, Semaphore};
+use parking_lot::Mutex;
+use tokio::sync::{broadcast, oneshot};
 
 use broadcast::error::TryRecvError;
 
 #[derive(Clone)]
 pub struct StopBroadcaster {
-    tx: broadcast::Sender<Option<Waker>>,
-    sem: Arc<Semaphore>,
+    tx: broadcast::Sender<()>,
     num: Arc<AtomicU32>,
-    waker: Option<Waker>,
+    waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl StopBroadcaster {
@@ -34,30 +34,26 @@ impl StopBroadcaster {
         let (tx, _) = broadcast::channel(1);
         Self {
             tx,
-            sem: Arc::new(Semaphore::new(0)),
             num: Arc::new(0.into()),
-            waker: None,
+            waker: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn listener(&self) -> StopListener {
         dbg!();
         self.num.fetch_add(1, Ordering::SeqCst);
-        self.sem.add_permits(1);
 
-        let perm = self.sem.clone().acquire_owned().await.unwrap();
         StopListener {
             rx: self.tx.subscribe(),
             num: self.num.clone(),
-            perm,
-            waker: None,
+            waker: self.waker.clone(),
         }
     }
 
     pub fn emit(&mut self) {
         // If a receiver is dropped, we don't care.
         dbg!("emit");
-        self.tx.send(self.waker.clone()).ok();
+        self.tx.send(()).ok();
     }
 
     pub fn len(&self) -> u32 {
@@ -69,12 +65,12 @@ impl Future for StopBroadcaster {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        dbg!(self.len());
         if self.len() == 0 {
             dbg!("READY");
             Poll::Ready(())
         } else {
-            self.waker = Some(cx.waker().clone());
+            dbg!(self.len());
+            *self.waker.lock() = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -87,17 +83,18 @@ impl Future for StopBroadcaster {
 /// When the StopListener is dropped, that signals the TaskManager that
 /// the task has ended.
 pub struct StopListener {
-    rx: broadcast::Receiver<Option<Waker>>,
+    rx: broadcast::Receiver<()>,
     num: Arc<AtomicU32>,
-    waker: Option<Waker>,
-    perm: OwnedSemaphorePermit,
+    waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl Drop for StopListener {
     fn drop(&mut self) {
+        dbg!("drop listener");
         self.num.fetch_sub(1, Ordering::SeqCst);
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
+        if let Some(waker) = self.waker.lock().as_ref() {
+            dbg!("wake by listener");
+            waker.wake_by_ref();
         }
     }
 }
@@ -106,22 +103,16 @@ impl Future for StopListener {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut waker = None;
-        let p = match Box::pin(self.rx.recv()).poll_unpin(cx) {
-            Poll::Ready(r) => {
+        match Box::pin(self.rx.recv()).poll_unpin(cx) {
+            Poll::Ready(_) => {
                 dbg!("listener ready");
-                waker = r.ok().flatten();
                 Poll::Ready(())
             }
             Poll::Pending => {
                 dbg!("listener pending");
                 Poll::Pending
             }
-        };
-        if let Some(waker) = waker {
-            self.waker = Some(waker);
         }
-        p
     }
 }
 
