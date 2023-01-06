@@ -12,6 +12,7 @@ tokio-stream = { version = "0.1", features = [ "sync" ] }
 tracing = "0.1"
 
 [dev-dependencies]
+parking_lot = "*"
 task-motel = { path = ".", features = ["test-util"]}
 
 [features]

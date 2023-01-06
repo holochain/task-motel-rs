@@ -301,6 +301,7 @@ name = "task-motel"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "parking_lot",
  "task-motel",
  "tokio",
  "tokio-stream",

@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-pub type TmResult = Result<(), String>;
+pub type TmResult<T = ()> = Result<T, String>;
 
 /// An error that is thrown from within a managed task
 pub trait TaskError {

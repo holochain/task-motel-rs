@@ -7,131 +7,181 @@
 //! Each Group has just one sender, which goes to itself and all ancestor groups.
 
 use std::{
+    ops::{Deref, DerefMut},
     pin::Pin,
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicI32, AtomicU32, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Waker},
 };
 
-use futures::Future;
-use tokio::sync::broadcast;
+use futures::{stream::FuturesUnordered, Future, FutureExt};
+use tokio::sync::{broadcast, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use broadcast::error::TryRecvError;
 
 #[derive(Clone)]
-pub struct StopBroadcaster(broadcast::Sender<()>);
+pub struct StopBroadcaster {
+    tx: broadcast::Sender<Option<Waker>>,
+    sem: Arc<Semaphore>,
+    num: Arc<AtomicU32>,
+    waker: Option<Waker>,
+}
 
 impl StopBroadcaster {
-    pub fn new() -> (Self, StopListener) {
+    pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1);
-        (StopBroadcaster(tx), StopListener(vec![tx.subscribe()]))
+        Self {
+            tx,
+            sem: Arc::new(Semaphore::new(0)),
+            num: Arc::new(0.into()),
+            waker: None,
+        }
     }
 
-    pub fn receiver(&self) -> broadcast::Receiver<()> {
-        self.0.subscribe()
+    pub async fn listener(&self) -> StopListener {
+        dbg!();
+        self.num.fetch_add(1, Ordering::SeqCst);
+        self.sem.add_permits(1);
+
+        let perm = self.sem.clone().acquire_owned().await.unwrap();
+        StopListener {
+            rx: self.tx.subscribe(),
+            num: self.num.clone(),
+            perm,
+            waker: None,
+        }
     }
 
     pub fn emit(&mut self) {
         // If a receiver is dropped, we don't care.
-        self.0.send(()).ok();
+        dbg!("emit");
+        self.tx.send(self.waker.clone()).ok();
     }
 
-    // fn into_inner(self) -> Vec<broadcast::Sender<()>> {
-    //     self.txs
-    // }
+    pub fn len(&self) -> u32 {
+        self.num.load(Ordering::SeqCst)
+    }
 }
 
-impl Drop for StopBroadcaster {
+impl Future for StopBroadcaster {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        dbg!(self.len());
+        if self.len() == 0 {
+            dbg!("READY");
+            Poll::Ready(())
+        } else {
+            self.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// StopListener should be incorporated into each user-defined task.
+/// It Derefs to a channel receiver which can be awaited. When resolved,
+/// the task should shut itself down.
+///
+/// When the StopListener is dropped, that signals the TaskManager that
+/// the task has ended.
+pub struct StopListener {
+    rx: broadcast::Receiver<Option<Waker>>,
+    num: Arc<AtomicU32>,
+    waker: Option<Waker>,
+    perm: OwnedSemaphorePermit,
+}
+
+impl Drop for StopListener {
     fn drop(&mut self) {
-        self.emit()
-    }
-}
-
-/// A Future which should be incorporated into each user-defined task.
-/// When the future resolves, the task should shut itself down gracefully.
-///
-///
-/// Multiple signal emitters can be registered to this signal.
-/// The intention is that as soon as one is received, the task should
-/// gracefully shut itself down. StopSignal is a simple future which ca
-#[derive(Default)]
-pub struct StopListener(Vec<broadcast::Receiver<()>>);
-
-impl StopListener {
-    pub fn subscribe(&mut self, tx: &StopBroadcaster) -> &mut Self {
-        self.0.push(tx.receiver());
-        self
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
+        self.num.fetch_sub(1, Ordering::SeqCst);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 }
 
 impl Future for StopListener {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0
-            .retain_mut(|s| s.try_recv() == Err(TryRecvError::Empty));
-
-        if self.0.is_empty() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut waker = None;
+        let p = match Box::pin(self.rx.recv()).poll_unpin(cx) {
+            Poll::Ready(r) => {
+                dbg!("listener ready");
+                waker = r.ok().flatten();
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                dbg!("listener pending");
+                Poll::Pending
+            }
+        };
+        if let Some(waker) = waker {
+            self.waker = Some(waker);
         }
+        p
     }
 }
+
+// impl StopListener {
+//     pub fn subscribe(&mut self, tx: &StopBroadcaster) -> &mut Self {
+//         self.0.push(tx.listener());
+//         self
+//     }
+
+//     pub fn len(&self) -> usize {
+//         self.0.len()
+//     }
+// }
+
+// impl Future for StopListener {
+//     type Output = ();
+
+//     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         self.0
+//             .retain_mut(|s| s.try_recv() == Err(TryRecvError::Empty));
+
+//         if self.0.is_empty() {
+//             Poll::Ready(())
+//         } else {
+//             Poll::Pending
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::*;
 
-    async fn not_ready(f: impl Future<Output = ()>) -> bool {
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
-            .await
-            .is_err()
-    }
-
-    async fn ready(f: impl Future<Output = ()>) -> bool {
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), f)
-            .await
-            .is_ok()
+    #[tokio::test]
+    async fn test_stop_empty() {
+        let x = StopBroadcaster::new();
+        assert_eq!(x.len(), 0);
+        assert!(ready(x).await);
     }
 
     #[tokio::test]
-    async fn test_signal_parallel() {
-        let a = StopBroadcaster::new();
-        let s1 = a.receiver();
-        let s2 = a.receiver();
-        assert!(not_ready(s1).await);
-        drop(a);
-        assert!(ready(s2).await);
-    }
-
-    #[tokio::test]
-    async fn test_signal_merged() {
+    async fn test_stop() {
         let mut x = StopBroadcaster::new();
-        let mut y = x.clone();
-        let a = StopBroadcaster::new();
-        let b = StopBroadcaster::new();
-        let c = StopBroadcaster::new();
-        x.merge(&a).merge(&b);
-        y.merge(&x).merge(&c);
+        let a = x.listener().await;
+        let b = x.listener().await;
+        let c = x.listener().await;
+        assert_eq!(x.len(), 3);
+        assert!(not_ready(x.clone()).await);
 
-        let s1 = y.receiver();
-        let s2 = y.receiver();
-        let s3 = y.receiver();
+        assert!(not_ready(a).await);
+        assert_eq!(x.len(), 2);
 
-        assert!(not_ready(s1).await);
-        drop(x);
-        assert!(not_ready(s2).await);
-        drop(c);
-        assert!(ready(s3).await);
+        x.emit();
+        assert!(ready(b).await);
+        assert_eq!(x.len(), 1);
+        assert!(not_ready(x.clone()).await);
 
-        let s4 = y.receiver();
-        let s5 = y.receiver();
-
-        assert!(not_ready(s4).await);
-        drop(y);
-        assert!(ready(s5).await);
+        assert!(ready(c).await);
+        assert_eq!(x.len(), 0);
+        assert!(ready(x).await);
     }
 }

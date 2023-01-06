@@ -14,6 +14,19 @@ pub struct Task<Info> {
     pub info: Info,
 }
 
+impl<Info> Task<Info> {
+    /// Constructor
+    pub fn new(
+        info: impl Into<Info>,
+        fut: impl 'static + Send + Sync + Future<Output = TmResult>,
+    ) -> Self {
+        Self {
+            handle: tokio::spawn(fut),
+            info: info.into(),
+        }
+    }
+}
+
 impl<Info: Clone + Unpin> Future for Task<Info> {
     type Output = (Info, Result<TmResult, JoinError>);
 

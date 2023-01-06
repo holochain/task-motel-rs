@@ -27,6 +27,8 @@ use tokio::{sync::broadcast::error::SendError, task::JoinHandle};
 
 #[cfg(test)]
 mod integration;
+#[cfg(test)]
+pub mod test_util;
 
 /// A JoinHandle returning the result of running the task
 pub type TaskHandle = JoinHandle<TmResult>;

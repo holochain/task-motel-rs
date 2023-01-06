@@ -7,7 +7,7 @@
 
 use core::pin::Pin;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     sync::Arc,
     task::{Context, Poll},
@@ -35,14 +35,14 @@ use crate::{
 #[derive(Debug)]
 pub struct TaskManager<GroupKey, Info: Clone + Unpin> {
     pub(crate) groups: HashMap<GroupKey, TaskGroup<Info>>,
-    pub(crate) parents: HashMap<GroupKey, GroupKey>,
+    pub(crate) children: HashMap<GroupKey, HashSet<GroupKey>>,
 }
 
 impl<GroupKey, Info: Clone + Unpin> Default for TaskManager<GroupKey, Info> {
     fn default() -> Self {
         Self {
             groups: Default::default(),
-            parents: Default::default(),
+            children: HashMap::new(),
         }
     }
 }
@@ -52,25 +52,33 @@ where
     GroupKey: std::fmt::Debug + Hash + Eq + Clone,
 {
     /// Add an empty task group, optionally specifying the parent group
-    pub fn add_group(&mut self, mut key: GroupKey, parent: Option<GroupKey>) {
+    pub fn add_group(&mut self, key: GroupKey, parent: Option<GroupKey>) -> StopBroadcaster {
         if let Some(parent) = parent {
-            self.parents.insert(key.clone(), parent);
+            self.children
+                .entry(parent)
+                .and_modify(|s| {
+                    s.insert(key.clone());
+                })
+                .or_insert_with(|| [key.clone()].into_iter().collect());
         }
-        let stopper = self
-            .groups
+        self.groups
             .entry(key.clone())
             .or_insert_with(TaskGroup::new)
             .stop_tx
-            .clone();
+            .clone()
+    }
 
-        while let Some(parent_key) = self.parents.get(&key) {
-            self.groups
-                .get_mut(parent_key)
-                .unwrap()
-                .stop_tx
-                .merge(&stopper);
-            key = parent_key.clone();
+    pub fn children(&self, key: &GroupKey) -> HashSet<GroupKey> {
+        let mut all = HashSet::new();
+        all.insert(key.clone());
+
+        if let Some(children) = self.children.get(key) {
+            for child in children {
+                all.extend(self.children(child));
+            }
         }
+
+        all
     }
 
     /// Add a task to a group
@@ -87,35 +95,19 @@ where
         }
     }
 
-    /// Remove a group (TODO refine what this means)
-    pub fn remove_group(&mut self, key: &GroupKey) -> TmResult {
-        // TODO: actually await group completion
-        if let Some(group) = self.groups.remove(key) {
-            // by dropping the group, we will signal all tasks to stop.
+    /// Remove a group, returning a future which resolves only after
+    /// all tasks have completed
+    pub fn remove_group(&mut self, key: &GroupKey) -> TmResult<StopBroadcaster> {
+        if let Some(mut group) = self.groups.remove(key) {
+            // Signal all tasks to stop.
+            group.stop_tx.emit();
+            // The return value is a future which can be awaited so that we know
+            // when all tasks have completed.
             Ok(group.stop_tx)
         } else {
             Err(format!("Group doesn't exist: {:?}", key))
         }
     }
-
-    /// Send the stop signal to all tasks in all groups.
-    /// This will not *necessarily* stop the tasks.
-    pub fn stop_all(&mut self) -> TmResult {
-        // TODO: actually await group completion
-        for group in self.groups.values_mut() {
-            group.stop_all()
-        }
-        Ok(())
-    }
-
-    // fn stop_group(&mut self, key: &GroupKey) -> TmResult {
-    //     if let Some(group) = self.groups.get_mut(key) {
-    //         group.stop_all();
-    //         Ok(())
-    //     } else {
-    //         Err(format!("Group doesn't exist: {:?}", key))
-    //     }
-    // }
 }
 
 impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
@@ -162,6 +154,8 @@ impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
 
 #[cfg(test)]
 mod tests {
+    use crate::test_util::*;
+
     use super::*;
 
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -172,25 +166,29 @@ mod tests {
         D,
     }
 
-    #[test]
-    fn test_group_nesting() {
+    #[tokio::test]
+    async fn test_group_nesting() {
         use GroupKey::*;
         let mut tm: TaskManager<GroupKey, String> = TaskManager::default();
 
-        tm.add_group(A, None);
-        tm.add_group(B, Some(A));
-        tm.add_group(C, Some(B));
+        let a = tm.add_group(A, None);
+        let b = tm.add_group(B, Some(A));
+        let c = tm.add_group(C, Some(B));
+        let d = tm.add_group(D, Some(B));
 
-        assert_eq!(tm.groups.get(&C).unwrap().stop_tx.len(), 1);
-        assert_eq!(tm.groups.get(&B).unwrap().stop_tx.len(), 2);
-        assert_eq!(tm.groups.get(&A).unwrap().stop_tx.len(), 3);
+        tm.add_task(&A, |stop| blocker("a1", stop)).await.unwrap();
+        tm.add_task(&A, |stop| blocker("a2", stop)).await.unwrap();
+        tm.add_task(&B, |stop| blocker("b1", stop)).await.unwrap();
+        tm.add_task(&C, |stop| blocker("c1", stop)).await.unwrap();
+        tm.add_task(&D, |stop| blocker("d1", stop)).await.unwrap();
+
+        assert!(not_ready(d).await);
+        let d = tm.remove_group(&D).unwrap();
+        dbg!(d.len());
+        // d.await;
+        assert!(ready(d).await);
+        assert!(not_ready(c).await);
 
         tm.add_group(D, Some(B));
-        assert_eq!(tm.groups.get(&D).unwrap().stop_tx.len(), 1);
-        assert_eq!(tm.groups.get(&C).unwrap().stop_tx.len(), 1);
-        assert_eq!(tm.groups.get(&B).unwrap().stop_tx.len(), 3);
-        assert_eq!(tm.groups.get(&A).unwrap().stop_tx.len(), 4);
-
-        tm.remove_group(&D).unwrap();
     }
 }
