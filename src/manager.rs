@@ -13,12 +13,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{future::JoinAll, FutureExt, Stream, StreamExt};
-use tokio::task::JoinError;
+use futures::{
+    future::JoinAll,
+    stream::{self, FuturesUnordered},
+    Future, FutureExt, Stream, StreamExt,
+};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use crate::{
     signal::{StopBroadcaster, StopListener},
-    Task, TaskGroup, TaskHandle, TmResult,
+    Task, TaskGroup, TaskStream, TmResult,
 };
 
 // impl StopSignal {
@@ -32,43 +36,59 @@ use crate::{
 // }
 
 /// Tracks tasks at the global conductor level, as well as each individual cell level.
-#[derive(Debug)]
 pub struct TaskManager<GroupKey, Info: Clone + Unpin> {
     pub(crate) groups: HashMap<GroupKey, TaskGroup<Info>>,
     pub(crate) children: HashMap<GroupKey, HashSet<GroupKey>>,
+    parent_map: Box<dyn Fn(&GroupKey) -> Option<GroupKey>>,
 }
 
-impl<GroupKey, Info: Clone + Unpin> Default for TaskManager<GroupKey, Info> {
-    fn default() -> Self {
+impl<GroupKey, Info> TaskManager<GroupKey, Info>
+where
+    GroupKey: std::fmt::Debug + Hash + Eq + Clone + Send + Sync + 'static,
+    Info: Clone + Unpin + Send + Sync + 'static,
+{
+    pub fn new(parent_map: impl Fn(&GroupKey) -> Option<GroupKey> + 'static) -> Self {
         Self {
             groups: Default::default(),
-            children: HashMap::new(),
+            children: Default::default(),
+            parent_map: Box::new(parent_map),
         }
     }
-}
 
-impl<GroupKey, Info: Clone + Unpin> TaskManager<GroupKey, Info>
-where
-    GroupKey: std::fmt::Debug + Hash + Eq + Clone,
-{
-    /// Add an empty task group, optionally specifying the parent group
-    pub fn add_group(&mut self, key: GroupKey, parent: Option<GroupKey>) -> StopBroadcaster {
-        if let Some(parent) = parent {
-            self.children
-                .entry(parent)
-                .and_modify(|s| {
-                    s.insert(key.clone());
-                })
-                .or_insert_with(|| [key.clone()].into_iter().collect());
-        }
+    /// Add a task to a group
+    pub fn add_task(&mut self, key: GroupKey, f: impl FnOnce(StopListener) -> Task<Info>)
+    // where
+    //     F: Future<Output = (GroupKey, Info)> + Send + Sync + 'static,
+    {
+        let group = self.group(key);
+        group.tasks.push(f(group.stopper.listener()));
+    }
+
+    pub fn num_tasks(&self, key: &GroupKey) -> usize {
         self.groups
-            .entry(key.clone())
-            .or_insert_with(TaskGroup::new)
-            .stop_tx
-            .clone()
+            .get(key)
+            .map(|group| group.tasks.len())
+            .unwrap_or_default()
     }
 
-    pub fn descendants(&self, key: &GroupKey) -> HashSet<GroupKey> {
+    /// Remove a group, returning the group as a stream which produces
+    /// all task results in the order they resolve.
+    pub fn stop_group(
+        &mut self,
+        key: &GroupKey,
+    ) -> impl Stream<Item = Result<(GroupKey, Info), JoinError>> {
+        let mut stream = futures::stream::SelectAll::new();
+        for key in self.descendants(key) {
+            if let Some(mut group) = self.groups.remove(&key) {
+                // Signal all tasks to stop.
+                group.stopper.emit();
+                stream.push(group.tasks.map(move |r| r.map(|info| (key.clone(), info))));
+            }
+        }
+        stream
+    }
+
+    pub(crate) fn descendants(&self, key: &GroupKey) -> HashSet<GroupKey> {
         let mut all = HashSet::new();
         all.insert(key.clone());
 
@@ -81,84 +101,25 @@ where
         all
     }
 
-    /// Add a task to a group
-    pub async fn add_task(
-        &mut self,
-        key: &GroupKey,
-        f: impl FnOnce(StopListener) -> Task<Info>,
-    ) -> TmResult {
-        if let Some(group) = self.groups.get_mut(key) {
-            group.add(f).await?;
-            Ok(())
-        } else {
-            Err(format!("Group doesn't exist: {:?}", key))
-        }
-    }
-
-    /// Remove a group, returning a future which resolves only after
-    /// all tasks have completed
-    pub fn remove_group(&mut self, key: &GroupKey) -> TmResult<JoinAll<StopBroadcaster>> {
-        let mut txs = vec![];
-        for key in self.descendants(key) {
-            if let Some(mut group) = self.groups.remove(&key) {
-                // Signal all tasks to stop.
-                group.stop_tx.emit();
-
-                // The return value is a future which can be awaited so that we know
-                // when all tasks have completed.
-                txs.push(group.stop_tx);
-            } else {
-                return Err(format!("Group doesn't exist: {:?}", key));
+    fn group(&mut self, key: GroupKey) -> &mut TaskGroup<Info> {
+        self.groups.entry(key.clone()).or_insert_with(|| {
+            if let Some(parent) = (self.parent_map)(&key) {
+                self.children
+                    .entry(parent)
+                    .or_insert_with(HashSet::new)
+                    .insert(key);
             }
-        }
-        Ok(futures::future::join_all(txs))
-    }
-}
-
-impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
-    for TaskManager<GroupKey, Info>
-{
-    type Item = (GroupKey, Info, Result<TmResult, JoinError>);
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<(GroupKey, Info, Result<TmResult, JoinError>)>> {
-        if self.groups.is_empty() {
-            dbg!("empty");
-            // Once all groups are removed, we consider the stream to have ended
-            return Poll::Ready(None);
-        }
-
-        if let Some(item) = self
-            .groups
-            .iter_mut()
-            .map(|(k, v)| {
-                // println!("tasks: {}", v.tasks.len());
-                match Stream::poll_next(Pin::new(&mut v.tasks), cx) {
-                    // A task in the group has a result
-                    Poll::Ready(Some((info, result))) => {
-                        dbg!();
-                        Some((k.clone(), info, result))
-                    }
-                    // No tasks in group
-                    Poll::Ready(None) => None,
-                    // No tasks ready (all tasks pending)
-                    Poll::Pending => None,
-                }
-            })
-            .flatten()
-            .next()
-        {
-            Poll::Ready(Some(item))
-        } else {
-            Poll::Pending
-        }
+            TaskGroup::new()
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_set;
+
+    use maplit::hashset;
+
     use crate::test_util::*;
 
     use super::*;
@@ -174,34 +135,71 @@ mod tests {
     #[tokio::test]
     async fn test_group_nesting() {
         use GroupKey::*;
-        let mut tm: TaskManager<GroupKey, String> = TaskManager::default();
+        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(|g| match g {
+            A => None,
+            B => Some(A),
+            C => Some(B),
+            D => Some(B),
+        });
 
-        let a = tm.add_group(A, None);
-        let b = tm.add_group(B, Some(A));
-        let c = tm.add_group(C, Some(B));
-        let d = tm.add_group(D, Some(B));
+        async fn collect<GroupKey: Hash + Eq, Info: Hash + Eq>(
+            stream: impl Stream<Item = Result<(GroupKey, Info), JoinError>>,
+        ) -> HashSet<(GroupKey, Info)> {
+            let infos: Vec<_> = stream.collect().await;
+            let infos: Result<HashSet<_>, _> = infos.into_iter().collect();
+            infos.unwrap()
+        }
 
-        tm.add_task(&A, |stop| blocker("a1", stop)).await.unwrap();
-        tm.add_task(&A, |stop| blocker("a2", stop)).await.unwrap();
-        tm.add_task(&B, |stop| blocker("b1", stop)).await.unwrap();
-        tm.add_task(&C, |stop| blocker("c1", stop)).await.unwrap();
-        tm.add_task(&D, |stop| blocker("d1", stop)).await.unwrap();
+        tm.add_task(A, |stop| blocker("a1", stop));
+        tm.add_task(A, |stop| blocker("a2", stop));
+        tm.add_task(B, |stop| blocker("b1", stop));
+        tm.add_task(C, |stop| blocker("c1", stop));
+        tm.add_task(D, |stop| blocker("d1", stop));
 
-        assert!(not_ready(d.clone()).await);
-        let rem_d = tm.remove_group(&D).unwrap();
-        rem_d.await;
-        assert!(ready(d).await);
-        assert!(not_ready(c.clone()).await);
+        assert_eq!(tm.num_tasks(&A), 2);
+        assert_eq!(tm.num_tasks(&B), 1);
+        assert_eq!(tm.num_tasks(&C), 1);
+        assert_eq!(tm.num_tasks(&D), 1);
 
-        let d = tm.add_group(D, Some(B));
-        tm.add_task(&D, |stop| blocker("dx", stop)).await.unwrap();
-        assert!(not_ready(d.clone()).await);
+        // let infos: Vec<_> = tm.stop_group(&D).collect().await;
+        // let infos: Result<Vec<_>, _> = infos.into_iter().collect();
+        assert_eq!(
+            collect(tm.stop_group(&D)).await,
+            hashset![(D, "d1".to_string())]
+        );
 
-        let rem_b = tm.remove_group(&B).unwrap();
-        assert!(not_ready(a.clone()).await);
-        rem_b.await;
-        assert!(ready(b).await);
-        assert!(ready(c).await);
-        assert!(ready(d).await);
+        assert_eq!(tm.num_tasks(&A), 2);
+        assert_eq!(tm.num_tasks(&B), 1);
+        assert_eq!(tm.num_tasks(&C), 1);
+        assert_eq!(tm.num_tasks(&D), 0);
+
+        tm.add_task(D, |stop| blocker("dx", stop));
+        assert_eq!(tm.num_tasks(&D), 1);
+
+        assert_eq!(
+            collect(tm.stop_group(&B)).await,
+            hashset![
+                (B, "b1".to_string()),
+                (C, "c1".to_string()),
+                (D, "dx".to_string())
+            ]
+        );
+
+        assert_eq!(tm.num_tasks(&A), 2);
+        assert_eq!(tm.num_tasks(&B), 0);
+        assert_eq!(tm.num_tasks(&C), 0);
+        assert_eq!(tm.num_tasks(&D), 0);
+
+        tm.add_task(D, |stop| blocker("dy", stop));
+        assert_eq!(tm.num_tasks(&D), 1);
+
+        assert_eq!(
+            collect(tm.stop_group(&A)).await,
+            hashset![
+                (A, "a1".to_string()),
+                (A, "a2".to_string()),
+                (D, "dy".to_string())
+            ]
+        );
     }
 }

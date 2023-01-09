@@ -7,9 +7,10 @@
 //! Each Group has just one sender, which goes to itself and all ancestor groups.
 
 use std::{
+    ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI32, AtomicU32, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -17,7 +18,9 @@ use std::{
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt};
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
+
+use broadcast::error::TryRecvError;
 
 #[derive(Clone)]
 pub struct StopBroadcaster {
@@ -36,7 +39,8 @@ impl StopBroadcaster {
         }
     }
 
-    pub fn listener(&self) -> StopListener {
+    pub async fn listener(&self) -> StopListener {
+        dbg!();
         self.num.fetch_add(1, Ordering::SeqCst);
         let mut rx = self.tx.subscribe();
 
@@ -52,6 +56,7 @@ impl StopBroadcaster {
 
     pub fn emit(&mut self) {
         // If a receiver is dropped, we don't care.
+        dbg!("emit");
         self.tx.send(()).ok();
     }
 
@@ -63,10 +68,12 @@ impl StopBroadcaster {
 impl Future for StopBroadcaster {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.len() == 0 {
+            dbg!("READY");
             Poll::Ready(())
         } else {
+            dbg!(self.len());
             *self.waker.lock() = Some(cx.waker().clone());
             Poll::Pending
         }
@@ -87,8 +94,10 @@ pub struct StopListener {
 
 impl Drop for StopListener {
     fn drop(&mut self) {
+        dbg!("drop listener");
         self.num.fetch_sub(1, Ordering::SeqCst);
         if let Some(waker) = self.waker.lock().as_ref() {
+            dbg!("wake by listener");
             waker.wake_by_ref();
         }
     }
@@ -99,11 +108,43 @@ impl Future for StopListener {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Box::pin(&mut self.done).poll_unpin(cx) {
-            Poll::Ready(_) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => {
+                dbg!("listener ready");
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                dbg!("listener pending");
+                Poll::Pending
+            }
         }
     }
 }
+
+// impl StopListener {
+//     pub fn subscribe(&mut self, tx: &StopBroadcaster) -> &mut Self {
+//         self.0.push(tx.listener());
+//         self
+//     }
+
+//     pub fn len(&self) -> usize {
+//         self.0.len()
+//     }
+// }
+
+// impl Future for StopListener {
+//     type Output = ();
+
+//     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         self.0
+//             .retain_mut(|s| s.try_recv() == Err(TryRecvError::Empty));
+
+//         if self.0.is_empty() {
+//             Poll::Ready(())
+//         } else {
+//             Poll::Pending
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -120,9 +161,9 @@ mod tests {
     #[tokio::test]
     async fn test_stop() {
         let mut x = StopBroadcaster::new();
-        let a = x.listener();
-        let b = x.listener();
-        let c = x.listener();
+        let a = x.listener().await;
+        let b = x.listener().await;
+        let c = x.listener().await;
         assert_eq!(x.len(), 3);
         assert!(not_ready(x.clone()).await);
 

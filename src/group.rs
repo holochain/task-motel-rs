@@ -1,73 +1,96 @@
-use std::fmt::Debug;
-
-use futures::stream::FuturesUnordered;
-
-use crate::{
-    signal::{StopBroadcaster, StopListener},
-    Task, Tasks, TmResult,
+use std::{
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    task::{Context, Poll},
 };
 
-/// An interface for managing a group of tasks.
-/// Tasks can be added to the group, and all tasks in the group can be stopped at once.
-// #[derive(Clone)]
+use futures::{
+    stream::{FuturesUnordered, SelectAll},
+    Stream,
+};
+use tokio::task::{JoinError, JoinHandle};
+
+use crate::{StopBroadcaster, Task};
+
 pub struct TaskGroup<Info> {
-    pub(crate) tasks: Tasks<Info>,
-    pub(crate) stop_tx: StopBroadcaster,
-    // new_task_tx: TaskSender<Info>,
-    // stop_tx: StopBroadcaster,
+    pub(crate) tasks: FuturesUnordered<Task<Info>>,
+    pub(crate) stopper: StopBroadcaster,
 }
 
 impl<Info> TaskGroup<Info> {
-    /// Constructor
     pub fn new() -> Self {
-        let tasks = FuturesUnordered::new();
-        let stop_tx = StopBroadcaster::new();
-        let group = Self { tasks, stop_tx };
-        group
-        // let (new_task_tx, new_task_rx) = tokio::sync::mpsc::channel(16);
-        // let task = tokio::spawn(run_task_manager(tasks, new_task_rx));
-        // (group, task)
-    }
-
-    /// Add a task by passing in a closure which accepts the StopSignal
-    /// for this group of tasks.
-    ///
-    /// The closure should make use of the StopSignal channel in an appropriate way,
-    /// so that the task will stop when a signal is received on the channel.
-    pub async fn add(&mut self, f: impl FnOnce(StopListener) -> Task<Info>) -> TmResult {
-        self.tasks.push(f(self.stop_tx.listener().await));
-        Ok(())
-        // self.new_task_tx.send(f(&mut self.stop_rx)).await
-    }
-
-    pub fn stopper(&self) -> StopBroadcaster {
-        self.stop_tx.clone()
-    }
-
-    /// Stop all tasks in this group
-    pub fn stop_all(&mut self) {
-        self.stop_tx.emit()
+        Self {
+            tasks: FuturesUnordered::new(),
+            stopper: StopBroadcaster::new(),
+        }
     }
 }
 
-// impl<Info> Drop for TaskGroup<Info> {
-//     fn drop(&mut self) {
-//         self.stop_all();
+pub type TaskStream<GroupKey, Info> =
+    futures::stream::SelectAll<FuturesUnordered<Task<(GroupKey, Info)>>>;
+
+// pub struct TaskStream<GroupKey, Info> {
+//     pub(crate) stream: SelectAll<(GroupKey, Info)>,
+// }
+
+// impl<GroupKey, Info> TaskStream<GroupKey, Info> {
+//     // pub fn stream(self) -> impl Stream<Item = (GroupKey, Info)> {
+
+//     // }
+// }
+// impl<GroupKey, Info> Deref for TaskStream<GroupKey, Info> {
+//     type Target = SelectAll<(GroupKey, Info)>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.stream
 //     }
 // }
 
-impl<Info: Clone + Unpin + Debug> std::fmt::Debug for TaskGroup<Info> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TaskGroup")
-            .field("# tasks", &self.tasks.iter().count())
-            .field(
-                "task info",
-                &self
-                    .tasks
-                    .iter()
-                    .map(|t| t.info.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
+// impl<GroupKey, Info> DerefMut for TaskStream<GroupKey, Info> {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.stream
+//     }
+// }
+
+// impl<GroupKey: Clone + Hash + Eq + Unpin, Info: Clone + Unpin> Stream
+//     for TaskStream<GroupKey, Info>
+// {
+//     type Item = (GroupKey, Result<Info, JoinError>);
+
+//     fn poll_next(
+//         mut self: Pin<&mut Self>,
+//         cx: &mut Context<'_>,
+//     ) -> Poll<Option<(GroupKey, Result<Info, JoinError>)>> {
+//         self.join_sets.
+//         if self.groups.is_empty() {
+//             dbg!("empty");
+//             // Once all groups are removed, we consider the stream to have ended
+//             return Poll::Ready(None);
+//         }
+
+//         if let Some(item) = self
+//             .groups
+//             .iter_mut()
+//             .map(|(k, v)| {
+//                 // println!("tasks: {}", v.tasks.len());
+//                 match Stream::poll_next(Pin::new(&mut v.tasks), cx) {
+//                     // A task in the group has a result
+//                     Poll::Ready(Some((info, result))) => {
+//                         dbg!();
+//                         Some((k.clone(), info, result))
+//                     }
+//                     // No tasks in group
+//                     Poll::Ready(None) => None,
+//                     // No tasks ready (all tasks pending)
+//                     Poll::Pending => None,
+//                 }
+//             })
+//             .flatten()
+//             .next()
+//         {
+//             Poll::Ready(Some(item))
+//         } else {
+//             Poll::Pending
+//         }
+//     }
+// }
