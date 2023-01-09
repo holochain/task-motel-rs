@@ -86,7 +86,7 @@ where
     /// all tasks have completed
     pub fn remove_group(&mut self, key: &GroupKey) -> TmResult<JoinAll<StopBroadcaster>> {
         let mut txs = vec![];
-        for key in self.descendants(key) {
+        for key in self.descendants(&key) {
             if let Some(mut group) = self.groups.remove(&key) {
                 // Signal all tasks to stop.
                 group.stop_tx.emit();
@@ -107,7 +107,7 @@ where
 
         if let Some(children) = self.children.get(key) {
             for child in children {
-                all.extend(self.descendants(child));
+                all.extend(self.descendants(&child));
             }
         }
 

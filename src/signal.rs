@@ -15,7 +15,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use futures::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt};
+use futures::{future::BoxFuture, Future, FutureExt};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 

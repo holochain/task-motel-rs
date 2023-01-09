@@ -5,25 +5,15 @@
 //! and their contained tasks stopped as well. The group is only completely removed when
 //! all descendent tasks have stopped.
 
-use core::pin::Pin;
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    sync::Arc,
-    task::{Context, Poll},
 };
 
-use futures::{
-    future::JoinAll,
-    stream::{self, FuturesUnordered},
-    Future, FutureExt, Stream, StreamExt,
-};
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use futures::{Stream, StreamExt};
+use tokio::task::JoinError;
 
-use crate::{
-    signal::{StopBroadcaster, StopListener},
-    Task, TaskGroup, TaskStream, TmResult,
-};
+use crate::{signal::StopListener, Task, TaskGroup};
 
 // impl StopSignal {
 //     pub async fn wait(mut self) -> () {
@@ -92,9 +82,11 @@ where
         let mut all = HashSet::new();
         all.insert(key.clone());
 
-        if let Some(children) = self.children.get(key) {
+        let this = &self;
+
+        if let Some(children) = this.children.get(&key) {
             for child in children {
-                all.extend(self.descendants(child));
+                all.extend(this.descendants(child));
             }
         }
 
@@ -116,9 +108,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_set;
-
     use maplit::hashset;
+    use rand::seq::SliceRandom;
 
     use crate::test_util::*;
 
@@ -130,6 +121,39 @@ mod tests {
         B,
         C,
         D,
+        E,
+        F,
+        G,
+    }
+
+    #[tokio::test]
+    async fn test_descendants() {
+        use GroupKey::*;
+        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(|g| match g {
+            A => None,
+            B => Some(A),
+            C => Some(B),
+            D => Some(B),
+            E => Some(D),
+            F => Some(E),
+            G => Some(C),
+        });
+
+        let mut keys = vec![A, B, C, D, E, F, G];
+        keys.shuffle(&mut rand::thread_rng());
+
+        // Set up the parent map in random order
+        for key in keys {
+            tm.add_task(key, |_| tokio::spawn(async { "".to_string() }))
+        }
+
+        assert_eq!(tm.descendants(&A), hashset! {A, B, C, D, E, F, G});
+        assert_eq!(tm.descendants(&B), hashset! {B, C, D, E, F, G});
+        assert_eq!(tm.descendants(&C), hashset! {C, G});
+        assert_eq!(tm.descendants(&D), hashset! {D, E, F});
+        assert_eq!(tm.descendants(&E), hashset! {E, F});
+        assert_eq!(tm.descendants(&F), hashset! {F});
+        assert_eq!(tm.descendants(&G), hashset! {G});
     }
 
     #[tokio::test]
@@ -140,6 +164,7 @@ mod tests {
             B => Some(A),
             C => Some(B),
             D => Some(B),
+            _ => None,
         });
 
         async fn collect<GroupKey: Hash + Eq, Info: Hash + Eq>(
