@@ -36,12 +36,12 @@ pub fn blocker(info: &str, stop_rx: StopListener) -> Task<String> {
 pub fn triggered(
     info: &str,
     stop_rx: StopListener,
-    trigger: impl 'static + Send + Sync + Unpin + Future<Output = ()>,
+    trigger: impl 'static + Send + Unpin + Future<Output = ()>,
 ) -> Task<String> {
     let info = info.to_string();
     let info2 = info.clone();
     let handle = tokio::spawn(async move {
-        futures::future::select(stop_rx, trigger).await;
+        futures::future::select(Box::pin(stop_rx), trigger).await;
         println!("stopped: {}", info2);
         Ok(())
     });

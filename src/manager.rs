@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{future::JoinAll, FutureExt, Stream, StreamExt};
 use tokio::task::JoinError;
 
 use crate::{
@@ -68,13 +68,13 @@ where
             .clone()
     }
 
-    pub fn children(&self, key: &GroupKey) -> HashSet<GroupKey> {
+    pub fn descendants(&self, key: &GroupKey) -> HashSet<GroupKey> {
         let mut all = HashSet::new();
         all.insert(key.clone());
 
         if let Some(children) = self.children.get(key) {
             for child in children {
-                all.extend(self.children(child));
+                all.extend(self.descendants(child));
             }
         }
 
@@ -97,16 +97,21 @@ where
 
     /// Remove a group, returning a future which resolves only after
     /// all tasks have completed
-    pub fn remove_group(&mut self, key: &GroupKey) -> TmResult<StopBroadcaster> {
-        if let Some(mut group) = self.groups.remove(key) {
-            // Signal all tasks to stop.
-            group.stop_tx.emit();
-            // The return value is a future which can be awaited so that we know
-            // when all tasks have completed.
-            Ok(group.stop_tx)
-        } else {
-            Err(format!("Group doesn't exist: {:?}", key))
+    pub fn remove_group(&mut self, key: &GroupKey) -> TmResult<JoinAll<StopBroadcaster>> {
+        let mut txs = vec![];
+        for key in self.descendants(key) {
+            if let Some(mut group) = self.groups.remove(&key) {
+                // Signal all tasks to stop.
+                group.stop_tx.emit();
+
+                // The return value is a future which can be awaited so that we know
+                // when all tasks have completed.
+                txs.push(group.stop_tx);
+            } else {
+                return Err(format!("Group doesn't exist: {:?}", key));
+            }
         }
+        Ok(futures::future::join_all(txs))
     }
 }
 
@@ -182,14 +187,21 @@ mod tests {
         tm.add_task(&C, |stop| blocker("c1", stop)).await.unwrap();
         tm.add_task(&D, |stop| blocker("d1", stop)).await.unwrap();
 
-        assert!(not_ready(d).await);
-        println!("--------------");
-        let d = tm.remove_group(&D).unwrap();
-        // d.await;
-        dbg!(d.len());
+        assert!(not_ready(d.clone()).await);
+        let rem_d = tm.remove_group(&D).unwrap();
+        rem_d.await;
         assert!(ready(d).await);
-        assert!(not_ready(c).await);
+        assert!(not_ready(c.clone()).await);
 
-        tm.add_group(D, Some(B));
+        let d = tm.add_group(D, Some(B));
+        tm.add_task(&D, |stop| blocker("dx", stop)).await.unwrap();
+        assert!(not_ready(d.clone()).await);
+
+        let rem_b = tm.remove_group(&B).unwrap();
+        assert!(not_ready(a.clone()).await);
+        rem_b.await;
+        assert!(ready(b).await);
+        assert!(ready(c).await);
+        assert!(ready(d).await);
     }
 }

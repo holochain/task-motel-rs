@@ -16,7 +16,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use futures::{stream::FuturesUnordered, Future, FutureExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
 
@@ -42,9 +42,13 @@ impl StopBroadcaster {
     pub async fn listener(&self) -> StopListener {
         dbg!();
         self.num.fetch_add(1, Ordering::SeqCst);
+        let mut rx = self.tx.subscribe();
 
         StopListener {
-            rx: self.tx.subscribe(),
+            done: async move {
+                rx.recv().await.ok();
+            }
+            .boxed(),
             num: self.num.clone(),
             waker: self.waker.clone(),
         }
@@ -83,7 +87,7 @@ impl Future for StopBroadcaster {
 /// When the StopListener is dropped, that signals the TaskManager that
 /// the task has ended.
 pub struct StopListener {
-    rx: broadcast::Receiver<()>,
+    done: BoxFuture<'static, ()>,
     num: Arc<AtomicU32>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
@@ -103,7 +107,7 @@ impl Future for StopListener {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Box::pin(self.rx.recv()).poll_unpin(cx) {
+        match Box::pin(&mut self.done).poll_unpin(cx) {
             Poll::Ready(_) => {
                 dbg!("listener ready");
                 Poll::Ready(())

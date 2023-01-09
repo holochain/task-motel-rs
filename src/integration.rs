@@ -71,9 +71,8 @@ async fn integration() {
         let tm2 = tm.clone();
 
         let check = tokio::spawn(async move {
-            dbg!("hi");
             loop {
-                match quickpoll(tm2.lock().await.next()).await {
+                match dbg!(quickpoll(tm2.lock().await.next()).await) {
                     Ok(Some(item)) => {
                         dbg!(item);
                     }
@@ -90,10 +89,10 @@ async fn integration() {
         dbg!();
         let root = tm.lock().await.remove_group(&Root).unwrap();
 
-        // assert_eq!(
-        //     tm.lock().await.groups.keys().cloned().collect::<Vec<_>>(),
-        //     vec![Root]
-        // );
+        assert_eq!(
+            tm.lock().await.groups.keys().cloned().collect::<Vec<_>>(),
+            vec![Root]
+        );
         dbg!();
 
         trigger.emit();
