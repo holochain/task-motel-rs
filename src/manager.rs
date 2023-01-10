@@ -10,34 +10,25 @@ use std::{
     hash::Hash,
 };
 
-use futures::{Stream, StreamExt};
+use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use tokio::task::JoinError;
 
-use crate::{signal::StopListener, Task, TaskGroup};
-
-// impl StopSignal {
-//     pub async fn wait(mut self) -> () {
-//         self.0.recv().await
-//     }
-// }
-
-// pub struct TaskPoller<GroupKey, TaskInfo> {
-// sender: mpsc::Sender<(GroupKey, Task<Info>)>,
-// }
+use crate::{signal::StopListener, StopBroadcaster, Task};
 
 /// Tracks tasks at the global conductor level, as well as each individual cell level.
-pub struct TaskManager<GroupKey, Info: Clone + Unpin> {
-    pub(crate) groups: HashMap<GroupKey, TaskGroup<Info>>,
-    pub(crate) children: HashMap<GroupKey, HashSet<GroupKey>>,
-    parent_map: Box<dyn Fn(&GroupKey) -> Option<GroupKey>>,
+pub struct TaskManager<GroupKey, Info> {
+    groups: HashMap<GroupKey, TaskGroup<Info>>,
+    children: HashMap<GroupKey, HashSet<GroupKey>>,
+    parent_map: Box<dyn 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey>>,
 }
 
 impl<GroupKey, Info> TaskManager<GroupKey, Info>
 where
-    GroupKey: std::fmt::Debug + Hash + Eq + Clone + Send + Sync + 'static,
-    Info: Clone + Unpin + Send + Sync + 'static,
+    GroupKey: Clone + Eq + Hash,
 {
-    pub fn new(parent_map: impl Fn(&GroupKey) -> Option<GroupKey> + 'static) -> Self {
+    pub fn new(
+        parent_map: impl 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey> + 'static,
+    ) -> Self {
         Self {
             groups: Default::default(),
             children: Default::default(),
@@ -46,10 +37,7 @@ where
     }
 
     /// Add a task to a group
-    pub fn add_task(&mut self, key: GroupKey, f: impl FnOnce(StopListener) -> Task<Info>)
-    // where
-    //     F: Future<Output = (GroupKey, Info)> + Send + Sync + 'static,
-    {
+    pub fn add_task(&mut self, key: GroupKey, f: impl FnOnce(StopListener) -> Task<Info>) {
         let group = self.group(key);
         group.tasks.push(f(group.stopper.listener()));
     }
@@ -105,6 +93,23 @@ where
         })
     }
 }
+
+struct TaskGroup<Info> {
+    pub(crate) tasks: FuturesUnordered<Task<Info>>,
+    pub(crate) stopper: StopBroadcaster,
+}
+
+impl<Info> TaskGroup<Info> {
+    pub fn new() -> Self {
+        Self {
+            tasks: FuturesUnordered::new(),
+            stopper: StopBroadcaster::new(),
+        }
+    }
+}
+
+pub type TaskStream<GroupKey, Info> =
+    futures::stream::SelectAll<FuturesUnordered<Task<(GroupKey, Info)>>>;
 
 #[cfg(test)]
 mod tests {

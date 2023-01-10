@@ -1,10 +1,4 @@
 //! Stop signal broadcasters and receivers
-//!
-//! Each TaskGroup has a number of channel receivers associated with it:
-//! one for itself, and one for each descendent Group.
-//! A Group is not considered stopped until all of its receivers have received
-//! at least one message.
-//! Each Group has just one sender, which goes to itself and all ancestor groups.
 
 use std::{
     pin::Pin,

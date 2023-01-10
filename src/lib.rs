@@ -1,9 +1,6 @@
 mod error;
 pub use error::*;
 
-mod group;
-pub use group::*;
-
 mod manager;
 pub use manager::*;
 
