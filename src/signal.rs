@@ -9,22 +9,20 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use futures::{future::BoxFuture, Future, FutureExt};
+use futures::{channel::oneshot, future::BoxFuture, Future, FutureExt};
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct StopBroadcaster {
-    tx: broadcast::Sender<()>,
+    txs: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     num: Arc<AtomicU32>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl StopBroadcaster {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(1);
         Self {
-            tx,
+            txs: Arc::new(Mutex::new(vec![])),
             num: Arc::new(0.into()),
             waker: Arc::new(Mutex::new(None)),
         }
@@ -32,13 +30,12 @@ impl StopBroadcaster {
 
     pub fn listener(&self) -> StopListener {
         self.num.fetch_add(1, Ordering::SeqCst);
-        let mut rx = self.tx.subscribe();
+        let (tx, rx) = oneshot::channel();
+
+        self.txs.lock().push(tx);
 
         StopListener {
-            done: async move {
-                rx.recv().await.ok();
-            }
-            .boxed(),
+            done: rx.map(|_| ()).boxed(),
             num: self.num.clone(),
             waker: self.waker.clone(),
         }
@@ -46,7 +43,9 @@ impl StopBroadcaster {
 
     pub fn emit(&mut self) {
         // If a receiver is dropped, we don't care.
-        self.tx.send(()).ok();
+        for tx in self.txs.lock().drain(..) {
+            tx.send(()).ok();
+        }
     }
 
     pub fn len(&self) -> u32 {

@@ -7,15 +7,13 @@ edition = "2021"
 
 [dependencies]
 futures = "0.3"
-parking_lot = "*"
-tokio = { version = "1.11", features = [ "full" ] }
-tokio-stream = { version = "0.1", features = [ "sync" ] }
+parking_lot = "0.12"
 tracing = "0.1"
 
 [dev-dependencies]
+# task-motel = { path = ".", features = ["test-util"]}
+
 maplit = "*"
 rand = "*"
-task-motel = { path = ".", features = ["test-util"]}
-
-[features]
-test-util = ["tokio/test-util"]
+tokio = { version = "1.11", features = [ "full" ] }
+tokio-stream = { version = "0.1", features = [ "sync" ] }

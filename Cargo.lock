@@ -357,7 +357,6 @@ dependencies = [
  "maplit",
  "parking_lot",
  "rand",
- "task-motel",
  "tokio",
  "tokio-stream",
  "tracing",
