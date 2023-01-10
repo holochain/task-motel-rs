@@ -12,4 +12,4 @@ pub use signal::*;
 pub mod test_util;
 
 /// A JoinHandle returning the result of running the task
-pub type Task<Info> = BoxFuture<'static, Info>;
+pub type Task<Outcome> = BoxFuture<'static, Outcome>;

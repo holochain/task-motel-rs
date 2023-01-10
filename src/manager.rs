@@ -15,13 +15,13 @@ use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
 use crate::{signal::StopListener, StopBroadcaster, Task};
 
 /// Tracks tasks at the global conductor level, as well as each individual cell level.
-pub struct TaskManager<GroupKey, Info> {
-    groups: HashMap<GroupKey, TaskGroup<Info>>,
+pub struct TaskManager<GroupKey, Outcome> {
+    groups: HashMap<GroupKey, TaskGroup<Outcome>>,
     children: HashMap<GroupKey, HashSet<GroupKey>>,
     parent_map: Box<dyn 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey>>,
 }
 
-impl<GroupKey, Info> TaskManager<GroupKey, Info>
+impl<GroupKey, Outcome> TaskManager<GroupKey, Outcome>
 where
     GroupKey: Clone + Eq + Hash,
 {
@@ -36,7 +36,7 @@ where
     }
 
     /// Add a task to a group
-    pub fn add_task<Fut: Future<Output = Info> + Send + 'static>(
+    pub fn add_task<Fut: Future<Output = Outcome> + Send + 'static>(
         &mut self,
         key: GroupKey,
         f: impl FnOnce(StopListener) -> Fut,
@@ -54,7 +54,7 @@ where
 
     /// Remove a group, returning the group as a stream which produces
     /// all task results in the order they resolve.
-    pub fn stop_group(&mut self, key: &GroupKey) -> impl Stream<Item = (GroupKey, Info)> {
+    pub fn stop_group(&mut self, key: &GroupKey) -> impl Stream<Item = (GroupKey, Outcome)> {
         let mut stream = futures::stream::SelectAll::new();
         for key in self.descendants(key) {
             if let Some(mut group) = self.groups.remove(&key) {
@@ -81,7 +81,7 @@ where
         all
     }
 
-    fn group(&mut self, key: GroupKey) -> &mut TaskGroup<Info> {
+    fn group(&mut self, key: GroupKey) -> &mut TaskGroup<Outcome> {
         self.groups.entry(key.clone()).or_insert_with(|| {
             if let Some(parent) = (self.parent_map)(&key) {
                 self.children
@@ -94,12 +94,12 @@ where
     }
 }
 
-struct TaskGroup<Info> {
-    pub(crate) tasks: FuturesUnordered<Task<Info>>,
+struct TaskGroup<Outcome> {
+    pub(crate) tasks: FuturesUnordered<Task<Outcome>>,
     pub(crate) stopper: StopBroadcaster,
 }
 
-impl<Info> TaskGroup<Info> {
+impl<Outcome> TaskGroup<Outcome> {
     pub fn new() -> Self {
         Self {
             tasks: FuturesUnordered::new(),
@@ -108,8 +108,8 @@ impl<Info> TaskGroup<Info> {
     }
 }
 
-pub type TaskStream<GroupKey, Info> =
-    futures::stream::SelectAll<FuturesUnordered<Task<(GroupKey, Info)>>>;
+pub type TaskStream<GroupKey, Outcome> =
+    futures::stream::SelectAll<FuturesUnordered<Task<(GroupKey, Outcome)>>>;
 
 #[cfg(test)]
 mod tests {
@@ -172,9 +172,9 @@ mod tests {
             _ => None,
         });
 
-        // async fn collect<GroupKey: Hash + Eq, Info: Hash + Eq>(
-        //     stream: impl Stream<Item = (GroupKey, Info)>,
-        // ) -> HashSet<(GroupKey, Info)> {
+        // async fn collect<GroupKey: Hash + Eq, Outcome: Hash + Eq>(
+        //     stream: impl Stream<Item = (GroupKey, Outcome)>,
+        // ) -> HashSet<(GroupKey, Outcome)> {
         //     let infos: Vec<_> = stream.collect().await;
         //     let infos: Result<HashSet<_>, _> = infos.into_iter().collect();
         //     infos.unwrap()
