@@ -10,8 +10,7 @@ use std::{
     hash::Hash,
 };
 
-use futures::{stream::FuturesUnordered, Stream, StreamExt};
-use tokio::task::JoinError;
+use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
 
 use crate::{signal::StopListener, StopBroadcaster, Task};
 
@@ -37,9 +36,13 @@ where
     }
 
     /// Add a task to a group
-    pub fn add_task(&mut self, key: GroupKey, f: impl FnOnce(StopListener) -> Task<Info>) {
+    pub fn add_task<Fut: Future<Output = Info> + Send + 'static>(
+        &mut self,
+        key: GroupKey,
+        f: impl FnOnce(StopListener) -> Fut,
+    ) {
         let group = self.group(key);
-        group.tasks.push(f(group.stopper.listener()));
+        group.tasks.push(f(group.stopper.listener()).boxed());
     }
 
     pub fn num_tasks(&self, key: &GroupKey) -> usize {
@@ -51,16 +54,13 @@ where
 
     /// Remove a group, returning the group as a stream which produces
     /// all task results in the order they resolve.
-    pub fn stop_group(
-        &mut self,
-        key: &GroupKey,
-    ) -> impl Stream<Item = Result<(GroupKey, Info), JoinError>> {
+    pub fn stop_group(&mut self, key: &GroupKey) -> impl Stream<Item = (GroupKey, Info)> {
         let mut stream = futures::stream::SelectAll::new();
         for key in self.descendants(key) {
             if let Some(mut group) = self.groups.remove(&key) {
                 // Signal all tasks to stop.
                 group.stopper.emit();
-                stream.push(group.tasks.map(move |r| r.map(|info| (key.clone(), info))));
+                stream.push(group.tasks.map(move |info| (key.clone(), info)));
             }
         }
         stream
@@ -149,7 +149,7 @@ mod tests {
 
         // Set up the parent map in random order
         for key in keys {
-            tm.add_task(key, |_| tokio::spawn(async { "".to_string() }))
+            tm.add_task(key, |_| map_jh(tokio::spawn(async { "".to_string() })))
         }
 
         assert_eq!(tm.descendants(&A), hashset! {A, B, C, D, E, F, G});
@@ -172,13 +172,13 @@ mod tests {
             _ => None,
         });
 
-        async fn collect<GroupKey: Hash + Eq, Info: Hash + Eq>(
-            stream: impl Stream<Item = Result<(GroupKey, Info), JoinError>>,
-        ) -> HashSet<(GroupKey, Info)> {
-            let infos: Vec<_> = stream.collect().await;
-            let infos: Result<HashSet<_>, _> = infos.into_iter().collect();
-            infos.unwrap()
-        }
+        // async fn collect<GroupKey: Hash + Eq, Info: Hash + Eq>(
+        //     stream: impl Stream<Item = (GroupKey, Info)>,
+        // ) -> HashSet<(GroupKey, Info)> {
+        //     let infos: Vec<_> = stream.collect().await;
+        //     let infos: Result<HashSet<_>, _> = infos.into_iter().collect();
+        //     infos.unwrap()
+        // }
 
         tm.add_task(A, |stop| blocker("a1", stop));
         tm.add_task(A, |stop| blocker("a2", stop));
@@ -194,7 +194,7 @@ mod tests {
         // let infos: Vec<_> = tm.stop_group(&D).collect().await;
         // let infos: Result<Vec<_>, _> = infos.into_iter().collect();
         assert_eq!(
-            collect(tm.stop_group(&D)).await,
+            tm.stop_group(&D).collect::<HashSet<_>>().await,
             hashset![(D, "d1".to_string())]
         );
 
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(tm.num_tasks(&D), 1);
 
         assert_eq!(
-            collect(tm.stop_group(&B)).await,
+            tm.stop_group(&B).collect::<HashSet<_>>().await,
             hashset![
                 (B, "b1".to_string()),
                 (C, "c1".to_string()),
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(tm.num_tasks(&D), 1);
 
         assert_eq!(
-            collect(tm.stop_group(&A)).await,
+            tm.stop_group(&A).collect::<HashSet<_>>().await,
             hashset![
                 (A, "a1".to_string()),
                 (A, "a2".to_string()),
