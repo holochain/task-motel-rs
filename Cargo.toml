@@ -1,9 +1,12 @@
 [package]
 name = "task-motel"
-version = "0.1.0"
+version = "0.1.0-rc.0"
+authors = ["Michael Dougherty <maackle.d@gmail.com>"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Opinionated (Tokio) task manager with nested task groups and stoppable tasks"
+license = "Apache-2.0"
+homepage = "https://github.com/maackle/task-motel-rs"
+documentation = "https://docs.rs/task-motel"
 
 [dependencies]
 futures = "0.3"
@@ -12,7 +15,7 @@ tokio = { version = "1.11", features = [ "full" ] }
 tracing = "0.1"
 
 [dev-dependencies]
-maplit = "*"
-rand = "*"
+maplit = "1.0"
+rand = "0.8"
 tokio = { version = "1.11", features = [ "full", "test-util" ] }
 tokio-stream = { version = "0.1", features = [ "sync" ] }
