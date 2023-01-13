@@ -9,13 +9,15 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use futures::{channel::oneshot, future::BoxFuture, Future, FutureExt};
+use futures::{
+    channel::oneshot, future::BoxFuture, stream::Fuse, Future, FutureExt, Stream, StreamExt,
+};
 use parking_lot::Mutex;
 
 #[derive(Clone)]
 pub struct StopBroadcaster {
     txs: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
-    num: Arc<AtomicU32>,
+    pub(crate) num: Arc<AtomicU32>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
@@ -78,6 +80,15 @@ pub struct StopListener {
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
+impl StopListener {
+    pub fn fuse_with<T, S: Unpin + Stream<Item = T>>(
+        self,
+        stream: S,
+    ) -> Fuse<Pin<Box<StopListenerFuse<T, S>>>> {
+        StreamExt::fuse(Box::pin(StopListenerFuse { stream, stop: self }))
+    }
+}
+
 impl Drop for StopListener {
     fn drop(&mut self) {
         self.num.fetch_sub(1, Ordering::SeqCst);
@@ -97,6 +108,34 @@ impl Future for StopListener {
         }
     }
 }
+
+pub struct StopListenerFuse<T, S: Stream<Item = T>> {
+    stream: S,
+    stop: StopListener,
+}
+
+impl<T, S: Unpin + Stream<Item = T>> Stream for StopListenerFuse<T, S> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(_) = Box::pin(&mut self.stop).poll_unpin(cx) {
+            return Poll::Ready(None);
+        }
+
+        Stream::poll_next(Pin::new(&mut self.stream), cx)
+    }
+}
+
+// impl Stream for StopListener {
+//     type Item = ();
+
+//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//         match Box::pin(&mut self.done).poll_unpin(cx) {
+//             Poll::Ready(_) => Poll::Ready(None),
+//             Poll::Pending => Poll::Pending,
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -130,5 +169,19 @@ mod tests {
         assert!(ready(c).await);
         assert_eq!(x.len(), 0);
         assert!(ready(x).await);
+    }
+
+    #[tokio::test]
+    async fn test_fuse() {
+        let mut tx = StopBroadcaster::new();
+        let rx = tx.listener();
+
+        let mut fused = rx.fuse_with(futures::stream::repeat(0));
+
+        assert_eq!(fused.next().await, Some(0));
+        assert_eq!(fused.next().await, Some(0));
+        tx.emit();
+        assert_eq!(fused.next().await, None);
+        assert_eq!(fused.next().await, None);
     }
 }

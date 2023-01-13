@@ -2,7 +2,7 @@ mod error;
 pub use error::*;
 
 mod manager;
-use futures::future::BoxFuture;
+use futures::task::FutureObj;
 pub use manager::*;
 
 mod signal;
@@ -12,4 +12,4 @@ pub use signal::*;
 pub mod test_util;
 
 /// A JoinHandle returning the result of running the task
-pub type Task<Outcome = ()> = BoxFuture<'static, Outcome>;
+pub type Task = FutureObj<'static, ()>;

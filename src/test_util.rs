@@ -1,4 +1,4 @@
-use futures::{Future, FutureExt};
+use futures::{future::BoxFuture, Future, FutureExt};
 use tokio::{task::JoinHandle, time::error::Elapsed};
 
 use crate::{StopListener, Task, TmResult};
@@ -20,28 +20,30 @@ pub async fn ok_fut(f: impl Future<Output = ()>) -> TmResult {
     Ok(())
 }
 
-pub fn map_jh(jh: JoinHandle<String>) -> Task<String> {
-    jh.map(|r| r.unwrap_or("ERROR".into())).boxed()
-}
+// pub fn map_jh(jh: JoinHandle<String>) -> BoxFuture<'static, String> {
+//     jh.map(|r| r.unwrap_or("ERROR".into())).boxed()
+// }
 
-pub fn blocker(info: &str, stop_rx: StopListener) -> Task<String> {
+pub fn blocker(info: &str, stop_rx: StopListener) -> BoxFuture<'static, String> {
     let info = info.to_string();
-    map_jh(tokio::spawn(async move {
+    async move {
         stop_rx.await;
         println!("stopped: {}", info);
         info
-    }))
+    }
+    .boxed()
 }
 
 pub fn triggered(
     info: &str,
     stop_rx: StopListener,
     trigger: impl 'static + Send + Unpin + Future<Output = ()>,
-) -> Task<String> {
+) -> BoxFuture<'static, String> {
     let info = info.to_string();
-    map_jh(tokio::spawn(async move {
+    async move {
         futures::future::select(Box::pin(stop_rx), trigger).await;
         println!("stopped: {}", info);
         info
-    }))
+    }
+    .boxed()
 }
