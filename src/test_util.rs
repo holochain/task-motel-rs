@@ -1,7 +1,7 @@
 use futures::{future::BoxFuture, Future, FutureExt};
-use tokio::{task::JoinHandle, time::error::Elapsed};
+use tokio::time::error::Elapsed;
 
-use crate::{StopListener, Task, TmResult};
+use crate::{StopListener, TmResult};
 
 pub async fn quickpoll<T, F: Future<Output = T>>(f: F) -> Result<T, Elapsed> {
     tokio::time::timeout(tokio::time::Duration::from_millis(10), f).await

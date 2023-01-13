@@ -15,11 +15,10 @@ use std::{
 };
 
 use futures::{
-    channel::mpsc, future::BoxFuture, stream::FuturesUnordered, task::SpawnExt, Future, FutureExt,
-    StreamExt,
+    channel::mpsc, future::BoxFuture, stream::FuturesUnordered, Future, FutureExt, StreamExt,
 };
 
-use crate::{signal::StopListener, StopBroadcaster, Task};
+use crate::{signal::StopListener, StopBroadcaster};
 
 /// Tracks tasks at the global conductor level, as well as each individual cell level.
 pub struct TaskManager<GroupKey, Outcome> {
@@ -154,11 +153,6 @@ impl TaskGroup {
             tasks: tokio::task::JoinSet::new(),
             stopper: StopBroadcaster::new(),
         }
-    }
-
-    pub fn replace_stopper(&mut self) -> GroupStop {
-        let stopper = std::mem::replace(&mut self.stopper, StopBroadcaster::new());
-        stopper.boxed()
     }
 }
 
