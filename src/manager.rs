@@ -154,6 +154,11 @@ impl TaskGroup {
             stopper: StopBroadcaster::new(),
         }
     }
+
+    // pub fn replace_stopper(&mut self) -> GroupStop {
+    //     let stopper = std::mem::replace(&mut self.stopper, StopBroadcaster::new());
+    //     stopper.boxed()
+    // }
 }
 
 pub type TaskStream<GroupKey, Outcome> =
