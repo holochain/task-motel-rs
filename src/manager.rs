@@ -8,10 +8,7 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicU32, Arc},
 };
 
 use futures::{
@@ -25,7 +22,7 @@ pub struct TaskManager<GroupKey, Outcome> {
     groups: HashMap<GroupKey, TaskGroup>,
     children: HashMap<GroupKey, HashSet<GroupKey>>,
     parent_map: Box<dyn 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey>>,
-    outcomes: mpsc::Sender<(GroupKey, Outcome)>,
+    outcome_rx: mpsc::Sender<(GroupKey, Outcome)>,
     // used to keep track of the number of tasks still running
     stopping_group_counts: Vec<Arc<AtomicU32>>,
 }
@@ -36,14 +33,14 @@ where
     Outcome: Send + 'static,
 {
     pub fn new(
-        outcomes: mpsc::Sender<(GroupKey, Outcome)>,
+        outcome_rx: mpsc::Sender<(GroupKey, Outcome)>,
         parent_map: impl 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey> + 'static,
     ) -> Self {
         Self {
             groups: Default::default(),
             children: Default::default(),
             parent_map: Box::new(parent_map),
-            outcomes,
+            outcome_rx,
             stopping_group_counts: Default::default(),
         }
     }
@@ -54,7 +51,7 @@ where
         key: GroupKey,
         f: impl FnOnce(StopListener) -> Fut + Send + 'static,
     ) {
-        let mut tx = self.outcomes.clone();
+        let mut tx = self.outcome_rx.clone();
         let group = self.group(key.clone());
         let listener = group.stopper.listener();
         let task = async move {
@@ -65,22 +62,8 @@ where
         group.tasks.spawn(task);
     }
 
-    pub fn num_tasks(&self, key: &GroupKey) -> usize {
-        let current = self
-            .groups
-            .get(key)
-            .map(|group| group.tasks.len())
-            .unwrap_or_default();
-        let pending = self
-            .stopping_group_counts
-            .iter()
-            .map(|c| c.load(Ordering::SeqCst))
-            .sum::<u32>() as usize;
-        current + pending
-    }
-
-    /// Remove a group, returning the group as a stream which produces
-    /// all task results in the order they resolve.
+    /// Remove a group, returning a future that can be waited upon for all tasks
+    /// in that group to complete.
     pub fn stop_group(&mut self, key: &GroupKey) -> GroupStop {
         let mut js = tokio::task::JoinSet::new();
         for key in self.descendants(key) {
@@ -96,21 +79,6 @@ where
 
         async move { finish_joinset(js).await }.boxed()
     }
-
-    // /// Remove a group, returning the group as a stream which produces
-    // /// all task results in the order they resolve.
-    // pub fn stop_group(&mut self, key: &GroupKey) -> GroupStop {
-    //     let mut js = tokio::task::JoinSet::new();
-    //     for key in self.descendants(key) {
-    //         let group = self.group(key);
-    //         // Signal all tasks to stop.
-    //         group.stopper.emit();
-    //         let stopper = group.replace_stopper();
-    //         js.spawn(stopper);
-    //     }
-
-    //     async move { js.shutdown().await }.boxed()
-    // }
 
     pub(crate) fn descendants(&self, key: &GroupKey) -> HashSet<GroupKey> {
         let mut all = HashSet::new();
@@ -138,6 +106,27 @@ where
             TaskGroup::new()
         })
     }
+
+    /// For testing purposes only, this is not a reliable indicator, since the JoinSet
+    /// is not polled except when a group is ending, so the count never actually
+    /// decreases.
+    #[cfg(test)]
+    fn num_tasks(&self, key: &GroupKey) -> usize {
+        let current = self
+            .groups
+            .get(key)
+            .map(|group| group.tasks.len())
+            .unwrap_or_default();
+
+        let pending = self
+            .stopping_group_counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .sum::<u32>() as usize;
+
+        // dbg!(current) + dbg!(pending)
+        current + pending
+    }
 }
 
 pub type GroupStop = BoxFuture<'static, ()>;
@@ -154,11 +143,6 @@ impl TaskGroup {
             stopper: StopBroadcaster::new(),
         }
     }
-
-    // pub fn replace_stopper(&mut self) -> GroupStop {
-    //     let stopper = std::mem::replace(&mut self.stopper, StopBroadcaster::new());
-    //     stopper.boxed()
-    // }
 }
 
 pub type TaskStream<GroupKey, Outcome> =
@@ -177,7 +161,7 @@ async fn finish_joinset(mut js: tokio::task::JoinSet<()>) {
 }
 #[cfg(test)]
 mod tests {
-    use futures::channel::mpsc;
+    use futures::{channel::mpsc, SinkExt};
     use maplit::hashset;
     use rand::seq::SliceRandom;
 
@@ -199,8 +183,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_task_completion() {
         use GroupKey::*;
-        let (tx, mut outcomes) = mpsc::channel(1);
-        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(tx, |g| match g {
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(outcome_tx, |g| match g {
             B => Some(A),
             _ => None,
         });
@@ -233,15 +217,15 @@ mod tests {
         assert_eq!(tm.num_tasks(&A), 0);
 
         // tm.stop_group(&A).await;
-        assert_eq!(outcomes.next().await.unwrap(), (A, "done".to_string()));
+        assert_eq!(outcome_rx.next().await.unwrap(), (A, "done".to_string()));
         assert_eq!(tm.num_tasks(&A), 0);
     }
 
     #[tokio::test]
     async fn test_descendants() {
         use GroupKey::*;
-        let (tx, outcomes) = mpsc::channel(1);
-        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(tx, |g| match g {
+        let (outcome_tx, outcome_rx) = mpsc::channel(1);
+        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(outcome_tx, |g| match g {
             A => None,
             B => Some(A),
             C => Some(B),
@@ -270,7 +254,7 @@ mod tests {
         tm.stop_group(&A).await;
 
         assert_eq!(
-            outcomes.take(keys.len()).collect::<HashSet<_>>().await,
+            outcome_rx.take(keys.len()).collect::<HashSet<_>>().await,
             hashset! {
                 (A, "A".to_string()),
                 (B, "B".to_string()),
@@ -286,8 +270,9 @@ mod tests {
     #[tokio::test]
     async fn test_group_nesting() {
         use GroupKey::*;
-        let (tx, mut outcomes) = mpsc::channel(1);
-        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(tx, |g| match g {
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let (mut trigger_tx, trigger_rx) = mpsc::channel(1);
+        let mut tm: TaskManager<GroupKey, String> = TaskManager::new(outcome_tx, |g| match g {
             A => None,
             B => Some(A),
             C => Some(B),
@@ -300,18 +285,25 @@ mod tests {
         tm.add_task(B, |stop| blocker("b1", stop));
         tm.add_task(C, |stop| blocker("c1", stop));
         tm.add_task(D, |stop| blocker("d1", stop));
+        tm.add_task(E, |stop| fused("e1", stop.fuse_with(trigger_rx.take(1))));
 
         assert_eq!(tm.num_tasks(&A), 2);
         assert_eq!(tm.num_tasks(&B), 1);
         assert_eq!(tm.num_tasks(&C), 1);
         assert_eq!(tm.num_tasks(&D), 1);
+        assert_eq!(tm.num_tasks(&E), 1);
+
+        trigger_tx.send(()).await.unwrap();
+        assert_eq!(outcome_rx.next().await.unwrap(), (E, "e1".to_string()));
+        // The actual task number will not decrease until the group is officially stopped.
+        assert_eq!(tm.num_tasks(&E), 1);
 
         let stopping = tm.stop_group(&D);
         assert_eq!(tm.num_tasks(&D), 1);
         stopping.await;
         assert_eq!(tm.num_tasks(&D), 0);
         assert_eq!(
-            hashset![outcomes.next().await.unwrap(),],
+            hashset![outcome_rx.next().await.unwrap(),],
             hashset![(D, "d1".to_string())]
         );
 
@@ -326,9 +318,9 @@ mod tests {
         tm.stop_group(&B).await;
         assert_eq!(
             hashset![
-                outcomes.next().await.unwrap(),
-                outcomes.next().await.unwrap(),
-                outcomes.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
             ],
             hashset![
                 (B, "b1".to_string()),
@@ -348,9 +340,9 @@ mod tests {
         tm.stop_group(&A).await;
         assert_eq!(
             hashset![
-                outcomes.next().await.unwrap(),
-                outcomes.next().await.unwrap(),
-                outcomes.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
+                outcome_rx.next().await.unwrap(),
             ],
             hashset![
                 (A, "a1".to_string()),

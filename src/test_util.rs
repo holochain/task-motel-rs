@@ -1,4 +1,4 @@
-use futures::{future::BoxFuture, Future, FutureExt};
+use futures::{future::BoxFuture, Future, FutureExt, Stream, StreamExt};
 use tokio::time::error::Elapsed;
 
 use crate::{StopListener, TmResult};
@@ -20,29 +20,24 @@ pub async fn ok_fut(f: impl Future<Output = ()>) -> TmResult {
     Ok(())
 }
 
-// pub fn map_jh(jh: JoinHandle<String>) -> BoxFuture<'static, String> {
-//     jh.map(|r| r.unwrap_or("ERROR".into())).boxed()
-// }
-
 pub fn blocker(info: &str, stop_rx: StopListener) -> BoxFuture<'static, String> {
     let info = info.to_string();
     async move {
         stop_rx.await;
-        println!("stopped: {}", info);
+        tracing::info!("stopped: {}", info);
         info
     }
     .boxed()
 }
 
-pub fn triggered(
+pub fn fused<'a>(
     info: &str,
-    stop_rx: StopListener,
-    trigger: impl 'static + Send + Unpin + Future<Output = ()>,
-) -> BoxFuture<'static, String> {
+    mut stream: impl Stream<Item = ()> + Unpin + Send + 'a,
+) -> BoxFuture<'a, String> {
     let info = info.to_string();
     async move {
-        futures::future::select(Box::pin(stop_rx), trigger).await;
-        println!("stopped: {}", info);
+        stream.next().await;
+        tracing::info!("stopped: {}", info);
         info
     }
     .boxed()

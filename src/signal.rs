@@ -6,40 +6,42 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use futures::{
     channel::oneshot, future::BoxFuture, stream::Fuse, Future, FutureExt, Stream, StreamExt,
 };
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub struct StopBroadcaster {
     txs: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     pub(crate) num: Arc<AtomicU32>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    notify: Arc<Notify>,
 }
 
 impl StopBroadcaster {
     pub fn new() -> Self {
         Self {
             txs: Arc::new(Mutex::new(vec![])),
-            num: Arc::new(0.into()),
-            waker: Arc::new(Mutex::new(None)),
+            num: Arc::new(AtomicU32::new(0)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
     pub fn listener(&self) -> StopListener {
         self.num.fetch_add(1, Ordering::SeqCst);
+        let notify = self.notify.clone();
         let (tx, rx) = oneshot::channel();
 
         self.txs.lock().push(tx);
 
         StopListener {
-            done: rx.map(|_| ()).boxed(),
+            stopped: rx.map(|_| ()).boxed(),
             num: self.num.clone(),
-            waker: self.waker.clone(),
+            notify,
         }
     }
 
@@ -53,17 +55,10 @@ impl StopBroadcaster {
     pub fn len(&self) -> u32 {
         self.num.load(Ordering::SeqCst)
     }
-}
 
-impl Future for StopBroadcaster {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.len() == 0 {
-            Poll::Ready(())
-        } else {
-            *self.waker.lock() = Some(cx.waker().clone());
-            Poll::Pending
+    pub async fn until_empty(&self) {
+        while self.len() > 0 {
+            self.notify.notified().await
         }
     }
 }
@@ -75,12 +70,14 @@ impl Future for StopBroadcaster {
 /// When the StopListener is dropped, that signals the TaskManager that
 /// the task has ended.
 pub struct StopListener {
-    done: BoxFuture<'static, ()>,
+    stopped: BoxFuture<'static, ()>,
     num: Arc<AtomicU32>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    notify: Arc<Notify>,
 }
 
 impl StopListener {
+    /// Modify a stream so that when the StopListener resolves, the stream is fused
+    /// and ends.
     pub fn fuse_with<T, S: Unpin + Stream<Item = T>>(
         self,
         stream: S,
@@ -92,9 +89,7 @@ impl StopListener {
 impl Drop for StopListener {
     fn drop(&mut self) {
         self.num.fetch_sub(1, Ordering::SeqCst);
-        if let Some(waker) = self.waker.lock().as_ref() {
-            waker.wake_by_ref();
-        }
+        self.notify.notify_one();
     }
 }
 
@@ -102,7 +97,7 @@ impl Future for StopListener {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Box::pin(&mut self.done).poll_unpin(cx) {
+        match Box::pin(&mut self.stopped).poll_unpin(cx) {
             Poll::Ready(_) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
@@ -126,17 +121,6 @@ impl<T, S: Unpin + Stream<Item = T>> Stream for StopListenerFuse<T, S> {
     }
 }
 
-// impl Stream for StopListener {
-//     type Item = ();
-
-//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-//         match Box::pin(&mut self.done).poll_unpin(cx) {
-//             Poll::Ready(_) => Poll::Ready(None),
-//             Poll::Pending => Poll::Pending,
-//         }
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +130,7 @@ mod tests {
     async fn test_stop_empty() {
         let x = StopBroadcaster::new();
         assert_eq!(x.len(), 0);
-        assert!(ready(x).await);
+        assert!(ready(x.until_empty()).await);
     }
 
     #[tokio::test]
@@ -156,7 +140,7 @@ mod tests {
         let b = x.listener();
         let c = x.listener();
         assert_eq!(x.len(), 3);
-        assert!(not_ready(x.clone()).await);
+        assert!(not_ready(x.until_empty()).await);
 
         assert!(not_ready(a).await);
         assert_eq!(x.len(), 2);
@@ -164,24 +148,41 @@ mod tests {
         x.emit();
         assert!(ready(b).await);
         assert_eq!(x.len(), 1);
-        assert!(not_ready(x.clone()).await);
+        assert!(not_ready(x.until_empty()).await);
 
         assert!(ready(c).await);
         assert_eq!(x.len(), 0);
-        assert!(ready(x).await);
+        assert!(ready(x.until_empty()).await);
     }
 
     #[tokio::test]
-    async fn test_fuse() {
-        let mut tx = StopBroadcaster::new();
-        let rx = tx.listener();
-
-        let mut fused = rx.fuse_with(futures::stream::repeat(0));
-
-        assert_eq!(fused.next().await, Some(0));
-        assert_eq!(fused.next().await, Some(0));
-        tx.emit();
-        assert_eq!(fused.next().await, None);
-        assert_eq!(fused.next().await, None);
+    async fn test_fuse_with() {
+        {
+            let mut tx = StopBroadcaster::new();
+            let rx = tx.listener();
+            let mut fused = rx.fuse_with(futures::stream::repeat(0));
+            assert_eq!(fused.next().await, Some(0));
+            assert_eq!(fused.next().await, Some(0));
+            tx.emit();
+            assert_eq!(fused.next().await, None);
+            assert_eq!(fused.next().await, None);
+            drop(fused);
+            tx.until_empty().await;
+            assert_eq!(tx.len(), 0);
+        }
+        {
+            let mut tx = StopBroadcaster::new();
+            let rx = tx.listener();
+            let mut fused = rx.fuse_with(futures::stream::repeat(0).take(1));
+            assert_eq!(fused.next().await, Some(0));
+            assert_eq!(fused.next().await, None);
+            assert_eq!(fused.next().await, None);
+            tx.emit();
+            assert_eq!(fused.next().await, None);
+            assert_eq!(fused.next().await, None);
+            drop(fused);
+            tx.until_empty().await;
+            assert_eq!(tx.len(), 0);
+        }
     }
 }
