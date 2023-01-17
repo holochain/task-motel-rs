@@ -1,6 +1,6 @@
 [package]
 name = "task-motel"
-version = "0.1.0-rc.0"
+version = "0.1.0-rc.1"
 authors = ["Michael Dougherty <maackle.d@gmail.com>"]
 edition = "2021"
 description = "Opinionated (Tokio) task manager with nested task groups and stoppable tasks"
