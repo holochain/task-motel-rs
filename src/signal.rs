@@ -83,8 +83,15 @@ impl StopListener {
         StreamExt::fuse(Box::pin(StopListenerFuse { stream, stop: self }))
     }
 
+    /// Accessor for the underlying oneshot receiver
     pub fn receiver(&mut self) -> &mut oneshot::Receiver<()> {
         &mut self.receiver
+    }
+
+    /// Returns false if the oneshot message has not yet been sent.
+    /// Returns true if the message was sent or the channel canceled/dropped.
+    pub fn ready(&mut self) -> bool {
+        !matches!(self.receiver.try_recv(), Ok(None))
     }
 }
 
@@ -139,15 +146,17 @@ mod tests {
     async fn test_stop() {
         let mut x = StopBroadcaster::new();
         let a = x.listener();
-        let b = x.listener();
+        let mut b = x.listener();
         let c = x.listener();
         assert_eq!(x.len(), 3);
         assert!(not_ready(x.until_empty()).await);
 
         assert!(not_ready(a).await);
         assert_eq!(x.len(), 2);
+        assert!(!b.ready());
 
         x.emit();
+        assert!(b.ready());
         assert!(ready(b).await);
         assert_eq!(x.len(), 1);
         assert!(not_ready(x.until_empty()).await);
@@ -155,6 +164,12 @@ mod tests {
         assert!(ready(c).await);
         assert_eq!(x.len(), 0);
         assert!(ready(x.until_empty()).await);
+
+        let y = StopBroadcaster::new();
+        let mut d = y.listener();
+        drop(y);
+        assert!(d.ready());
+        assert!(ready(d).await);
     }
 
     #[tokio::test]
