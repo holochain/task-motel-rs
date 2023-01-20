@@ -9,9 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{
-    channel::oneshot, future::BoxFuture, stream::Fuse, Future, FutureExt, Stream, StreamExt,
-};
+use futures::{channel::oneshot, stream::Fuse, Future, FutureExt, Stream, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -39,7 +37,7 @@ impl StopBroadcaster {
         self.txs.lock().push(tx);
 
         StopListener {
-            stopped: rx.map(|_| ()).boxed(),
+            receiver: rx,
             num: self.num.clone(),
             notify,
         }
@@ -70,7 +68,7 @@ impl StopBroadcaster {
 /// When the StopListener is dropped, that signals the TaskManager that
 /// the task has ended.
 pub struct StopListener {
-    stopped: BoxFuture<'static, ()>,
+    receiver: oneshot::Receiver<()>,
     num: Arc<AtomicU32>,
     notify: Arc<Notify>,
 }
@@ -83,6 +81,10 @@ impl StopListener {
         stream: S,
     ) -> Fuse<Pin<Box<StopListenerFuse<T, S>>>> {
         StreamExt::fuse(Box::pin(StopListenerFuse { stream, stop: self }))
+    }
+
+    pub fn receiver(&mut self) -> &mut oneshot::Receiver<()> {
+        &mut self.receiver
     }
 }
 
@@ -97,7 +99,7 @@ impl Future for StopListener {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Box::pin(&mut self.stopped).poll_unpin(cx) {
+        match Box::pin(&mut self.receiver).poll_unpin(cx) {
             Poll::Ready(_) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
