@@ -14,11 +14,13 @@ use std::{
 use futures::{
     channel::mpsc, future::BoxFuture, stream::FuturesUnordered, Future, FutureExt, StreamExt,
 };
+use tracing::Instrument;
 
 use crate::{signal::StopListener, StopBroadcaster};
 
 /// Tracks tasks at the global conductor level, as well as each individual cell level.
 pub struct TaskManager<GroupKey, Outcome> {
+    span: Option<tracing::Span>,
     groups: HashMap<GroupKey, TaskGroup>,
     children: HashMap<GroupKey, HashSet<GroupKey>>,
     parent_map: Box<dyn 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey>>,
@@ -37,6 +39,22 @@ where
         parent_map: impl 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey> + 'static,
     ) -> Self {
         Self {
+            span: None,
+            groups: Default::default(),
+            children: Default::default(),
+            parent_map: Box::new(parent_map),
+            outcome_rx,
+            stopping_group_counts: Default::default(),
+        }
+    }
+
+    pub fn new_instrumented(
+        span: tracing::Span,
+        outcome_rx: mpsc::Sender<(GroupKey, Outcome)>,
+        parent_map: impl 'static + Send + Sync + Fn(&GroupKey) -> Option<GroupKey> + 'static,
+    ) -> Self {
+        Self {
+            span: Some(span),
             groups: Default::default(),
             children: Default::default(),
             parent_map: Box::new(parent_map),
@@ -51,11 +69,16 @@ where
         key: GroupKey,
         f: impl FnOnce(StopListener) -> Fut + Send + 'static,
     ) {
+        let span = self.span.clone();
         let mut tx = self.outcome_rx.clone();
         let group = self.group(key.clone());
         let listener = group.stopper.listener();
         let task = async move {
-            let outcome = f(listener).await;
+            let outcome = if let Some(span) = span {
+                f(listener).instrument(span).await
+            } else {
+                f(listener).await
+            };
             tx.try_send((key, outcome)).ok();
         }
         .boxed();
